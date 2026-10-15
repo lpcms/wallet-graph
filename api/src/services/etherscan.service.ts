@@ -130,6 +130,9 @@ export class EtherscanService {
   // Чтобы снять лимит, идём окнами по 10 страниц от новых блоков к старым: страницы окна
   // качаются параллельно, следующее окно заканчивается на блоке последней полученной tx.
   // Транзакции граничного блока приходят дважды — убираем дубли по hash.
+  //
+  // Конец истории — ПУСТАЯ страница, а не неполная: Etherscan иногда отдаёт 999 записей
+  // на странице, за которой есть ещё (так у TLM обрывалось на 999 переводах из 10 000).
   private async fetchByBlocks(params: Record<string, string>, maxTx: number): Promise<EtherscanTransaction[]> {
     const PAGES_PER_WINDOW = Math.floor(10_000 / CONFIG.pageSize)
     const all: EtherscanTransaction[] = []
@@ -146,6 +149,7 @@ export class EtherscanService {
       let last: EtherscanTransaction | undefined
       let complete = true
       for (const page of pages) {
+        if (page.length === 0) { complete = false; break }
         for (const tx of page) {
           last = tx
           if (seen.has(tx.hash)) continue
@@ -153,11 +157,10 @@ export class EtherscanService {
           all.push(tx)
           added++
         }
-        if (page.length < CONFIG.pageSize) { complete = false; break }
       }
       console.log(`  Блоки ≤ ${endBlock}: +${added} tx (всего ${all.length})`)
 
-      // Неполное окно — история закончилась. Нет прогресса — всё окно в одном блоке, дальше не сдвинуться.
+      // Пустая страница — история закончилась. Нет прогресса — всё окно в одном блоке, дальше не сдвинуться.
       if (!complete || !last || added === 0) break
       const lastBlock = Number(last.blockNumber)
       if (lastBlock >= endBlock) break
@@ -169,7 +172,8 @@ export class EtherscanService {
   }
 
   // Страницы качаются пачками по 10 параллельно (темп держит общая очередь request),
-  // результат — как при последовательной загрузке: страницы по порядку до первой неполной.
+  // результат — как при последовательной загрузке: страницы по порядку до первой пустой
+  // (не неполной: Etherscan иногда отдаёт 999 записей посреди истории).
   private async fetchAllPages(params: Record<string, string>): Promise<EtherscanTransaction[]> {
     const PARALLEL_PAGES = 10
     // Дальше 10 000-й записи Etherscan не отдаёт (page × offset ≤ 10000) — такие страницы не запрашиваем
@@ -181,10 +185,10 @@ export class EtherscanService {
       const pages = await Promise.all(
         Array.from({ length: last - first + 1 }, (_, i) => this.fetchPage(params, first + i)),
       )
-      const incomplete = pages.findIndex(p => p.length < CONFIG.pageSize)
-      pages.slice(0, incomplete === -1 ? pages.length : incomplete + 1).forEach(p => all.push(...p))
-      if (incomplete !== -1) {
-        console.log(`  Страница ${first + incomplete} неполная — данные закончились`)
+      const empty = pages.findIndex(p => p.length === 0)
+      pages.slice(0, empty === -1 ? pages.length : empty).forEach(p => all.push(...p))
+      if (empty !== -1) {
+        console.log(`  Страница ${first + empty} пустая — данные закончились`)
         break
       }
     }

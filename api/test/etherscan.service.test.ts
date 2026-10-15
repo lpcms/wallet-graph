@@ -48,6 +48,37 @@ describe('EtherscanService.getTokenTransactions', () => {
   })
 })
 
+describe('Etherscan: неполная страница посреди истории', () => {
+  // Etherscan иногда отдаёт 999 записей вместо 1000, хотя дальше есть ещё (так было у TLM)
+  const shortFirstPage = (all: EtherscanTransaction[]) => (q: URLSearchParams) => {
+    const page = Number(q.get('page')), offset = Number(q.get('offset'))
+    if (page * offset > 10_000) return { status: '0', message: 'NOTOK', result: 'Result window is too large' }
+    const endBlock = Number(q.get('endblock') ?? 99_999_999)
+    const slice = all.filter(t => Number(t.blockNumber) <= endBlock).slice((page - 1) * offset, page * offset)
+    const result = page === 1 && slice.length === offset ? slice.slice(0, offset - 1) : slice
+    return result.length ? ok(result) : { status: '0', message: 'No transactions found', result: [] }
+  }
+
+  it('граф токена не обрывается на странице из 999 записей', async () => {
+    const transfers = Array.from({ length: 3_000 }, (_, i) => tx(addr(1 + (i % 9)), addr(20 + (i % 5)), 1, 9_000 - i))
+    mockEtherscan(shortFirstPage(transfers))
+
+    const result = await new EtherscanService().getTokenTransactions(addr(0x70))
+
+    expect(result).toHaveLength(2_999)   // 999 + 1000 + 1000, а не 999
+  })
+
+  it('история кошелька не обрывается на странице из 999 записей', async () => {
+    const wallet = addr(1)
+    const history = Array.from({ length: 2_500 }, (_, i) => tx(wallet, addr(2), 1, 5_000 - i))
+    mockEtherscan(shortFirstPage(history))
+
+    const result = await new EtherscanService().getWalletTransactions(wallet)
+
+    expect(result).toHaveLength(2_499)
+  })
+})
+
 describe('EtherscanService.request (через getBalance)', () => {
   it('повторяет запрос после ответа rate limit', async () => {
     let n = 0

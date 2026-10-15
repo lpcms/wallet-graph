@@ -463,6 +463,7 @@ export class GraphController {
         // Обходим через startblock/endblock: каждый следующий запрос
         // начинается с блока последней полученной транзакции.
         let startBlock  = 0
+        const seenTransfers = new Set<string>()
         const endBlock  = 999999999
 
         while (hasMore && (MAX_PAGES === 0 || pageNum <= MAX_PAGES)) {
@@ -476,10 +477,13 @@ export class GraphController {
             break
           }
 
-          // Дедупликация — последняя tx предыдущего батча = первая следующего
-          const newTxs = transactions.length > 0
-            ? data.result.filter(tx => tx.hash !== transactions[transactions.length - 1]?.hash)
-            : data.result
+          // Дедупликация: транзакции граничного блока приходят в обоих батчах
+          const newTxs = data.result.filter(tx => {
+            const key = `${tx.hash}:${tx.from}:${tx.to}:${tx.value}`
+            if (seenTransfers.has(key)) return false
+            seenTransfers.add(key)
+            return true
+          })
 
           transactions.push(...newTxs)
           if (!ticker && data.result[0]?.tokenSymbol) ticker = data.result[0].tokenSymbol
@@ -494,18 +498,15 @@ export class GraphController {
 
           console.log(`  [Full] Батч ${pageNum}: +${newTxs.length} tx (блоки ${startBlock}–${endBlock}), итого ${transactions.length}`)
 
-          if (data.result.length < PAGE_SIZE) {
-            hasMore = false  // последняя страница — данные закончились
+          // Конец — пустой ответ (проверка выше) или батч без продвижения по блокам.
+          // Неполный батч концом не считаем: Etherscan иногда отдаёт 999 записей посреди истории
+          const lastBlock = Number(data.result[data.result.length - 1].blockNumber)
+          if (newTxs.length === 0 || lastBlock <= startBlock) {
+            hasMore = false
           } else {
-            // Следующий запрос — начиная с блока последней tx этого батча
-            const lastBlock = Number(data.result[data.result.length - 1].blockNumber)
-            if (lastBlock <= startBlock) {
-              hasMore = false  // защита от зависания
-            } else {
-              startBlock = lastBlock  // включительно — дедупликация выше уберёт дубль
-              pageNum++
-              await new Promise(r => setTimeout(r, DELAY_MS))
-            }
+            startBlock = lastBlock  // включительно — дедупликация выше уберёт дубли
+            pageNum++
+            await new Promise(r => setTimeout(r, DELAY_MS))
           }
         }
 
