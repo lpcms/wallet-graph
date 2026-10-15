@@ -24,3 +24,6 @@ npm-debug.log*
 Thumbs.db
 .idea/
 .vscode/
+
+# Служебные материалы (скриншоты, заметки) — только локально
+info_no_commit/
