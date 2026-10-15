@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common'
 import { CEX_ADDRESSES } from '../constants/cex-addresses'
 import type { EtherscanTransaction, GrowthReadiness, MarkovPhase, ClusterInfo, AddressFeatures, BehaviorProfile } from '../types'
 import { kmeans } from 'ml-kmeans'
+import { txAmount } from '../lib/amount'
 import { UnionFind } from '../lib/union-find'
 import { AnalyticsService } from './analytics.service'
 
@@ -62,11 +63,11 @@ export class ClusterService {
       const sendRatio = txCount > 0 ? sends.length / txCount : 0
 
       // [2] Средний ETH на транзакцию
-      const totalEth = txs.reduce((s, tx) => s + Number(tx.value) / 1e18, 0)
+      const totalEth = txs.reduce((s, tx) => s + txAmount(tx), 0)
       const avgEthPerTx = txCount > 0 ? totalEth / txCount : 0
 
       // [3] Доля пылевых транзакций (< 0.001 ETH)
-      const dustTx   = txs.filter(tx => Number(tx.value) / 1e18 < 0.001 && Number(tx.value) > 0)
+      const dustTx   = txs.filter(tx => txAmount(tx) < 0.001 && Number(tx.value) > 0)
       const dustRatio = txCount > 0 ? dustTx.length / txCount : 0
 
       // [4] Активные часы суток (уникальные, 0..24)
@@ -220,7 +221,7 @@ export class ClusterService {
       const dustSends = new Map<string, EtherscanTransaction[]>()
       transactions.forEach(tx => {
         if (isCex(tx.from) || isCex(tx.to)) return
-        const eth = Number(tx.value) / 1e18
+        const eth = txAmount(tx)
         if (eth > 0 && eth < DUST_ETH) {
           if (!dustSends.has(tx.from)) dustSends.set(tx.from, [])
           dustSends.get(tx.from)!.push(tx)
@@ -258,7 +259,7 @@ export class ClusterService {
       transactions.forEach(tx => {
         if (!tx.from || !tx.to) return
         if (isCex(tx.from) || isCex(tx.to)) return
-        const eth = Number(tx.value) / 1e18
+        const eth = txAmount(tx)
         if (eth >= MIN_ETH) {
           if (!fundedBy.has(tx.from)) fundedBy.set(tx.from, [])
           fundedBy.get(tx.from)!.push({ to: tx.to, eth, ts: Number(tx.timeStamp) })
@@ -391,7 +392,7 @@ export class ClusterService {
       const fromRoot = tx.from ? uf.find(tx.from) : undefined
       const toRoot   = tx.to   ? uf.find(tx.to)   : undefined
       if (fromRoot === toRoot) return
-      const eth = Number(tx.value) / 1e18
+      const eth = txAmount(tx)
       if (fromRoot) clusterOut.set(fromRoot, (clusterOut.get(fromRoot) || 0) + eth)
       if (toRoot)   clusterIn.set(toRoot,    (clusterIn.get(toRoot)    || 0) + eth)
     })

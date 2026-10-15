@@ -18,6 +18,9 @@ export interface GraphNode {
   tokenBalance: number
   usdBalance: string
   usdValue: string
+  balanceKnown: boolean       // false — реальный баланс ETH не запрашивался (граф токена)
+  tokenFlow?: number          // граф токена: приход − расход токена в загруженных переводах
+  tokenSymbol?: string
   isExchange: boolean
   exchangeName?: string
   clusterId?: string
@@ -37,7 +40,7 @@ export interface GraphLink {
   targetAddress: string
   linkType: string
   transactionWeight: number
-  usdWeight: number
+  usdWeight?: number          // только для переводов ETH: цены токена нет
   unix: number
   txId: string
   isCrossCluster: boolean

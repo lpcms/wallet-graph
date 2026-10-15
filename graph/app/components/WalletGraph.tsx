@@ -23,6 +23,12 @@ function shortAddress(address: string): string {
   return `${address.slice(0, 6)}...${address.slice(-4)}`
 }
 
+// Приход − расход токена в загруженных переводах: «+1 234,5 USDT»
+function formatTokenFlow(amount: number, symbol = 'TOKEN'): string {
+  const sign = amount > 0 ? '+' : ''
+  return `${sign}${amount.toLocaleString('ru-RU', { maximumFractionDigits: 2 })} ${symbol}`
+}
+
 function formatUsd(raw: string): string {
   const num = parseFloat(raw.replace('$', ''))
   if (isNaN(num)) return raw
@@ -72,7 +78,8 @@ function getNodeColor(node: Node): { color: string; borderColor: string } {
     return { color: '#ef4444', borderColor: '#fca5a5' }
   if (node.nodeType === 'DEXBUY' || node.nodeType === 'CEXBUY' || node.nodeType === 'DEPLOYER')
     return { color: '#22c55e', borderColor: '#86efac' }
-  if (node.usdBalance === '0' || node.usdBalance === '0.000000')
+  // Пустой — только если баланс действительно известен и равен нулю
+  if (node.balanceKnown !== false && (node.usdBalance === '0' || node.usdBalance === '0.000000'))
     return { color: '#f59e0b', borderColor: '#fcd34d' }
   return { color: '#3b82f6', borderColor: '#93c5fd' }
 }
@@ -476,7 +483,16 @@ export default function WalletGraph({ nodes, links }: Props) {
           {/* Строки: базовые */}
           {[
             { label: 'Тип',         value: selectedNode.nodeType,                          green: false },
-            { label: 'Баланс',      value: formatUsd(selectedNode.usdValue || '$0.00'),    green: true  },
+            {
+              label: 'Баланс',
+              value: selectedNode.balanceKnown === false ? '—' : formatUsd(selectedNode.usdValue || '$0.00'),
+              green: selectedNode.balanceKnown !== false,
+            },
+            ...(selectedNode.tokenFlow !== undefined ? [{
+              label: 'Поток токена',
+              value: formatTokenFlow(selectedNode.tokenFlow, selectedNode.tokenSymbol),
+              green: false,
+            }] : []),
           ].map(row => (
             <div key={row.label} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 13, marginBottom: 7 }}>
               <span style={{ color: '#64748b' }}>{row.label}</span>

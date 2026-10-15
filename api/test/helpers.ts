@@ -14,6 +14,16 @@ export function tx(from: string, to: string, eth: number, block = 1, timeStamp =
   }
 }
 
+// Перевод токена (как в ответе tokentx): value в минимальных единицах, tokenDecimal — число знаков
+export function tokenTx(from: string, to: string, amount: number, decimals = 6, timeStamp = 1_700_000_000, symbol = 'USDT'): EtherscanTransaction {
+  return {
+    ...tx(from, to, 0, 1, timeStamp),
+    value:        (BigInt(Math.round(amount * 1e6)) * 10n ** BigInt(decimals) / 1_000_000n).toString(),
+    tokenDecimal: String(decimals),
+    tokenSymbol:  symbol,
+  }
+}
+
 export const addr = (n: number) => `0x${n.toString(16).padStart(40, '0')}`
 
 // Подменяет fetch: handler получает query-параметры запроса к Etherscan и возвращает тело ответа

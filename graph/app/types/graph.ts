@@ -46,6 +46,9 @@ export interface Node {
   tokenBalance: number
   usdBalance: string
   usdValue?: string
+  balanceKnown?: boolean   // false — реальный баланс ETH не запрашивался (граф токена)
+  tokenFlow?: number       // граф токена: приход − расход токена
+  tokenSymbol?: string
   weightedAverageBuyPrice?: number
   weightedAverageSellPrice?: number
   // Шаг 1: CEX
@@ -75,7 +78,7 @@ export interface Link {
   targetAddress: string
   linkType: string
   transactionWeight: number
-  usdWeight: number
+  usdWeight?: number       // только для переводов ETH
   unix: number
   txId: string
   isCrossCluster?: boolean

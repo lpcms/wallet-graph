@@ -8,6 +8,7 @@ import { AnalyticsService } from '../services/analytics.service'
 import { EtherscanService } from '../services/etherscan.service'
 import { GraphBuilderService } from '../services/graph-builder.service'
 import { ModelService } from '../services/model.service'
+import { txAmount } from '../lib/amount'
 
 // ===== КОНТРОЛЛЕР =====
 
@@ -277,7 +278,7 @@ export class GraphController {
       if (from) knownEoa.add(from)
       const other = from === root ? to : from
       if (!other || other === root || CEX_ADDRESSES.has(other)) continue
-      volume.set(other, (volume.get(other) || 0) + Number(tx.value) / 1e18)
+      volume.set(other, (volume.get(other) || 0) + txAmount(tx))
     }
 
     const ranked = [...volume.entries()]

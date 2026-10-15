@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common'
 import type { EtherscanTransaction, GrowthReadiness, MarkovPhase } from '../types'
+import { txAmount } from '../lib/amount'
 
 // ===== GROWTH READINESS + MARKOV СЕРВИС =====
 
@@ -35,7 +36,7 @@ export class AnalyticsService {
     // Чем больше входящих относительно исходящих — тем выше накопление.
     let totalIn = 0, totalOut = 0
     clusterTxs.forEach(tx => {
-      const eth = Number(tx.value) / 1e18
+      const eth = txAmount(tx)
       if (addrSet.has(tx.to?.toLowerCase())   && !addrSet.has(tx.from?.toLowerCase())) totalIn  += eth
       if (addrSet.has(tx.from?.toLowerCase()) && !addrSet.has(tx.to?.toLowerCase()))   totalOut += eth
     })
@@ -138,7 +139,7 @@ export class AnalyticsService {
 
       let inFlow = 0, outFlow = 0
       batch.forEach(tx => {
-        const eth = Number(tx.value) / 1e18
+        const eth = txAmount(tx)
         if (addrSet.has(tx.to?.toLowerCase())   && !addrSet.has(tx.from?.toLowerCase())) inFlow  += eth
         if (addrSet.has(tx.from?.toLowerCase()) && !addrSet.has(tx.to?.toLowerCase()))   outFlow += eth
       })
