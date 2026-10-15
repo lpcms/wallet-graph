@@ -1,7 +1,7 @@
 import { Controller, Get, Param, Res } from '@nestjs/common'
 import type { Response } from 'express'
 import { CONFIG } from '../config'
-import { CEX_ADDRESSES } from '../constants/cex-addresses'
+import { KNOWN_ADDRESSES, SERVICE_ADDRESSES } from '../constants/known-addresses'
 import type { EtherscanTransaction, GrowthReadiness, MarkovPhase, ClusterInfo } from '../types'
 import { ClusterService } from '../services/cluster.service'
 import { AnalyticsService } from '../services/analytics.service'
@@ -9,6 +9,7 @@ import { EtherscanService } from '../services/etherscan.service'
 import { GraphBuilderService } from '../services/graph-builder.service'
 import { ModelService } from '../services/model.service'
 import { txAmount } from '../lib/amount'
+import { ZERO_ADDRESS, type EntityHints } from '../lib/entities'
 
 // ===== КОНТРОЛЛЕР =====
 
@@ -39,7 +40,8 @@ export class GraphController {
       fullMaxTx:       CONFIG.fullMaxPages === 0 ? 'unlimited' : CONFIG.fullPageSize * CONFIG.fullMaxPages,
       fullDelayMs:     CONFIG.fullDelayMs,
       fullCacheTtlMin: CONFIG.fullCacheTtl / 60_000,
-      cexAddresses:    CEX_ADDRESSES.size,
+      knownAddresses:  KNOWN_ADDRESSES.size,
+      serviceAddresses: SERVICE_ADDRESSES.size,
       timestamp:       new Date().toISOString(),
     }
   }
@@ -48,7 +50,9 @@ export class GraphController {
     txInput: EtherscanTransaction[],
     ethPriceUsd: number,
     meta: Record<string, unknown>,
-    opts: { rootAddress?: string } = {},   // rootAddress — режим кошелька: балансы всех адресов + капитализация
+    // rootAddress — режим кошелька: балансы всех адресов + капитализация;
+    // tokenAddress — режим токена: эмитент и создатель токена для категорий узлов
+    opts: { rootAddress?: string; tokenAddress?: string } = {},
   ) {
     const root = opts.rootAddress?.toLowerCase()
     let transactions = txInput
@@ -56,7 +60,7 @@ export class GraphController {
 
     // ── Предфильтрация транзакций ─────────────────────────────────────
     // Применяем до любого анализа — сокращает объём данных в 2–5 раз
-    const isCex = (addr: string) => CEX_ADDRESSES.has(addr?.toLowerCase())
+    const isCex = (addr: string) => SERVICE_ADDRESSES.has(addr?.toLowerCase())
 
     let filtered = transactions
 
@@ -132,11 +136,11 @@ export class GraphController {
         if (tx.from) graphAddrs.add(tx.from.toLowerCase())
         if (tx.to)   graphAddrs.add(tx.to.toLowerCase())
       })
-      balanceAddresses = [...graphAddrs].filter(addr => !CEX_ADDRESSES.has(addr))
+      balanceAddresses = [...graphAddrs].filter(addr => !SERVICE_ADDRESSES.has(addr))
     } else {
       balanceAddresses = [...addrCount.entries()]
         .sort((a, b) => b[1] - a[1])
-        .filter(([addr]) => !CEX_ADDRESSES.has(addr))
+        .filter(([addr]) => !SERVICE_ADDRESSES.has(addr))
         .slice(0, 15)
         .map(([addr]) => addr)
     }
@@ -148,16 +152,27 @@ export class GraphController {
         console.log(`    ${addr.slice(0, 10)}... = ${bal.toFixed(4)} ETH = $${(bal * ethPriceUsd).toFixed(2)}`))
     }
 
+    // ── Контракты и сервисные кошельки — до кластеризации ─────────────
+    // Они нужны и для категорий узлов, и чтобы исключить их из кластеров «одного владельца»:
+    // через пул DEX проходят сделки тысяч посторонних людей, их нельзя склеивать с кошельками
+    const entityHints = root
+      ? await this.detectWalletHints(root, balanceAddresses, transactions, realBalances)
+      : await this.collectTokenHints(opts.tokenAddress, addrCount)
+    const excluded = new Set([...(entityHints.contracts ?? []), ...(entityHints.services ?? [])])
+
     console.log('  Запускаем K-means + Union-Find кластеризацию...')
     // Для больших наборов (>20000 tx) пропускаем GR/Markov для одиночных адресов
     const skipAnalytics = transactions.length > 10000
     if (skipAnalytics) console.log('  [Opt] Большой набор — GR/Markov только для кластеров')
-    const clusterMap = this.clusterService.buildClusters(transactions, realBalances, ethPriceUsd, this.analyticsService, skipAnalytics)
-    const graph = this.graphBuilderService.buildGraph(txForGraph, realBalances, ethPriceUsd, clusterMap)
+    const clusterMap = this.clusterService.buildClusters(
+      transactions, realBalances, ethPriceUsd, this.analyticsService, skipAnalytics, excluded,
+    )
 
     const capitalization = root
-      ? await this.computeCapitalization(root, balanceAddresses, transactions, realBalances, clusterMap, ethPriceUsd)
+      ? await this.computeCapitalization(root, balanceAddresses, realBalances, clusterMap, ethPriceUsd, entityHints)
       : undefined
+
+    const graph = this.graphBuilderService.buildGraph(txForGraph, realBalances, ethPriceUsd, clusterMap, entityHints)
 
     // Топ кластеров для сводки
     const seen = new Set<string>()
@@ -197,49 +212,72 @@ export class GraphController {
     }
   }
 
-  // ── Капитализация группы кошелька (ETH-балансы × курс) ────────────
-  // full    — все адреса графа (кошелёк + 1-й и 2-й хоп)
-  // cluster — кластер самого кошелька (адреса, которые Union-Find считает одним владельцем)
-  // В обоих вариантах исключены биржи (CEX_ADDRESSES) и смарт-контракты: на WETH, мостах,
-  // стейкинге лежат миллиарды чужих средств — они не принадлежат группе.
-  private async computeCapitalization(
+  // ── Контракты и сервисные кошельки в графе кошелька ───────────────
+  // Отправитель обычной tx — всегда кошелёк (EOA): контракты сами tx не инициируют.
+  // Остальные адреса с ненулевым балансом проверяем на контракт (250 самых крупных),
+  // кошельки от 10 ETH — на 10 000+ tx (100 самых крупных): это горячие кошельки бирж
+  // вне списка, маркет-мейкеры, боты. Сам исследуемый кошелёк не исключаем никогда.
+  private async detectWalletHints(
     root: string,
     graphAddresses: string[],
     transactions: EtherscanTransaction[],
     realBalances: Map<string, number>,
-    clusterMap: Map<string, ClusterInfo>,
-    ethPriceUsd: number,
-  ) {
-    // Отправитель обычной tx — всегда кошелёк (EOA): контракты сами tx не инициируют
+  ): Promise<EntityHints> {
     const knownEoa = new Set<string>()
     transactions.forEach(tx => { if (tx.from) knownEoa.add(tx.from.toLowerCase()) })
 
-    const clusterAddresses = (clusterMap.get(root)?.addresses ?? [root])
-      .map(a => a.toLowerCase())
-      .filter(a => !CEX_ADDRESSES.has(a))
-    const missing = clusterAddresses.filter(a => !realBalances.has(a))
-    if (missing.length) {
-      (await this.etherscanService.getBalances(missing)).forEach((bal, addr) => realBalances.set(addr, bal))
-    }
-
-    // На контракт проверяем адреса с ненулевым балансом, про которые не известно, что это EOA.
-    // Берём не больше 250 самых крупных — мелочь на сумму почти не влияет, а запросы дорогие.
     const MAX_CONTRACT_CHECKS = 250
-    const toCheck = [...new Set([...graphAddresses, ...clusterAddresses])]
+    const toCheck = graphAddresses
       .filter(a => !knownEoa.has(a) && (realBalances.get(a) ?? 0) > 0)
       .sort((a, b) => (realBalances.get(b) ?? 0) - (realBalances.get(a) ?? 0))
       .slice(0, MAX_CONTRACT_CHECKS)
     const contracts = await this.etherscanService.getContracts(toCheck)
 
-    // Крупные кошельки с 10 000+ tx — горячие кошельки бирж вне CEX_ADDRESSES, маркет-мейкеры, боты.
-    // Их баланс — деньги клиентов, а не группы. Сам исследуемый кошелёк не исключаем никогда.
     const MIN_SERVICE_CHECK_ETH = 10
     const MAX_SERVICE_CHECKS    = 100
-    const serviceCandidates = [...new Set([...graphAddresses, ...clusterAddresses])]
+    const serviceCandidates = graphAddresses
       .filter(a => a !== root && !contracts.has(a) && (realBalances.get(a) ?? 0) >= MIN_SERVICE_CHECK_ETH)
       .sort((a, b) => (realBalances.get(b) ?? 0) - (realBalances.get(a) ?? 0))
       .slice(0, MAX_SERVICE_CHECKS)
     const services = await this.etherscanService.getHighActivity(serviceCandidates)
+
+    // Проверенные кошельки: отправители обычных tx и проверенные адреса, оказавшиеся не контрактами
+    const verified = new Set([...knownEoa, ...toCheck.filter(a => !contracts.has(a))])
+    console.log(`  [Entities] контрактов ${contracts.size} (проверено ${toCheck.length}),` +
+      ` сервисных кошельков 10k+ tx ${services.size} (проверено ${serviceCandidates.length})`)
+    return { contracts, services, verified }
+  }
+
+  // ── Капитализация группы кошелька (ETH-балансы × курс) ────────────
+  // full    — все адреса графа (кошелёк + 1-й и 2-й хоп)
+  // cluster — кластер самого кошелька (адреса, которые Union-Find считает одним владельцем)
+  // В обоих вариантах исключены биржи (SERVICE_ADDRESSES), смарт-контракты и сервисные кошельки:
+  // на WETH, мостах, стейкинге и биржах лежат миллиарды чужих средств — они не принадлежат группе.
+  private async computeCapitalization(
+    root: string,
+    graphAddresses: string[],
+    realBalances: Map<string, number>,
+    clusterMap: Map<string, ClusterInfo>,
+    ethPriceUsd: number,
+    hints: EntityHints,
+  ) {
+    const contracts = hints.contracts ?? new Set<string>()
+    const services  = hints.services  ?? new Set<string>()
+
+    // Участники кластера могут быть вне графа (он ограничен 2000 адресами) — догружаем их балансы
+    // и проверяем на контракт тех, кого ещё не проверяли
+    const clusterAddresses = (clusterMap.get(root)?.addresses ?? [root])
+      .map(a => a.toLowerCase())
+      .filter(a => !SERVICE_ADDRESSES.has(a))
+    const missing = clusterAddresses.filter(a => !realBalances.has(a))
+    if (missing.length) {
+      (await this.etherscanService.getBalances(missing)).forEach((bal, addr) => realBalances.set(addr, bal))
+    }
+    const unchecked = clusterAddresses.filter(a =>
+      !hints.verified?.has(a) && !contracts.has(a) && (realBalances.get(a) ?? 0) > 0)
+    if (unchecked.length) {
+      (await this.etherscanService.getContracts(unchecked)).forEach(a => contracts.add(a))
+    }
 
     const isGroupMember = (a: string) => !contracts.has(a) && !services.has(a)
     const sumEth = (addrs: string[]) => addrs.reduce((s, a) => s + (realBalances.get(a) ?? 0), 0)
@@ -250,8 +288,6 @@ export class GraphController {
 
     console.log(`  [Cap] полная: ${fullAddrs.length} адресов = ${fullEth.toFixed(2)} ETH = $${(fullEth * ethPriceUsd).toFixed(0)}`)
     console.log(`  [Cap] кластер: ${clusterAddrs.length} адресов = ${clusterEth.toFixed(2)} ETH = $${(clusterEth * ethPriceUsd).toFixed(0)}`)
-    console.log(`  [Cap] исключено: контрактов ${contracts.size} (проверено ${toCheck.length}),` +
-      ` сервисных кошельков 10k+ tx ${services.size} (проверено ${serviceCandidates.length})`)
 
     return {
       fullUsd:           Math.round(fullEth * ethPriceUsd),
@@ -263,6 +299,37 @@ export class GraphController {
       excludedContracts: contracts.size,
       excludedServices:  services.size,
     }
+  }
+
+  // ── Категории владельцев в графе токена ───────────────────────────
+  // Самые активные участники — пулы, роутеры и горячие кошельки бирж: проверяем
+  // топ-100 на контракты и топ-20 кошельков на 10 000+ tx. Плюс эмитент: контракт
+  // токена и его создатель. Остальные адреса считаются кошельками.
+  private async collectTokenHints(tokenAddress: string | undefined, addrCount: Map<string, number>): Promise<EntityHints> {
+    const MAX_CONTRACT_CHECKS = 100
+    const MAX_SERVICE_CHECKS  = 20
+    const token  = tokenAddress?.toLowerCase()
+    const active = [...addrCount.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .map(([addr]) => addr)
+      .filter(addr => !KNOWN_ADDRESSES.has(addr) && addr !== ZERO_ADDRESS && addr !== token)
+
+    const creators  = await this.etherscanService.getContractCreators([...(token ? [token] : []), ...active.slice(0, MAX_CONTRACT_CHECKS)])
+    const contracts = new Set(creators.keys())
+    const issuers   = new Map<string, string>()
+    if (token) {
+      issuers.set(token, 'контракт токена')
+      const creator = creators.get(token)
+      if (creator) issuers.set(creator, 'создатель токена')
+    }
+    const services = await this.etherscanService.getHighActivity(
+      active.filter(addr => !contracts.has(addr)).slice(0, MAX_SERVICE_CHECKS),
+    )
+    // Проверенные кошельки — проверенные на контракт и им не оказавшиеся.
+    // Отправитель перевода токена не доказывает EOA: токены рассылают и контракты (пулы, роутеры)
+    const verified = new Set(active.slice(0, MAX_CONTRACT_CHECKS).filter(addr => !contracts.has(addr)))
+    console.log(`  [Entities] контрактов ${contracts.size}, сервисных кошельков ${services.size}, эмитентов ${issuers.size}`)
+    return { contracts, services, issuers, verified }
   }
 
   // ── 2-й хоп: топ-50 контрагентов кошелька по объёму ETH ──────────
@@ -277,7 +344,7 @@ export class GraphController {
       const to   = tx.to?.toLowerCase()
       if (from) knownEoa.add(from)
       const other = from === root ? to : from
-      if (!other || other === root || CEX_ADDRESSES.has(other)) continue
+      if (!other || other === root || SERVICE_ADDRESSES.has(other)) continue
       volume.set(other, (volume.get(other) || 0) + txAmount(tx))
     }
 
@@ -333,7 +400,7 @@ export class GraphController {
       this.etherscanService.getEthPriceUsd(),
     ])
     const ticker = transactions[0]?.tokenSymbol || 'UNKNOWN'
-    return this.buildAndReturn(transactions, ethPriceUsd, { tokenAddress: address, ticker })
+    return this.buildAndReturn(transactions, ethPriceUsd, { tokenAddress: address, ticker }, { tokenAddress: address })
   }
 
   // ── Накопительный режим (SSE) ────────────────────────────────────
@@ -459,7 +526,7 @@ export class GraphController {
         tokenAddress: address,
         ticker,
         fullLoad: true,
-      })
+      }, { tokenAddress: address })
 
       send({ type: 'done', ...result })
       console.log(`  [Full] Готово: ${result.nodes.length} узлов, ${result.links.length} рёбер`)

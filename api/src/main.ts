@@ -1,7 +1,7 @@
 import 'reflect-metadata'
 import { NestFactory } from '@nestjs/core'
 import { CONFIG } from './config'
-import { CEX_ADDRESSES } from './constants/cex-addresses'
+import { KNOWN_ADDRESSES, SERVICE_ADDRESSES } from './constants/known-addresses'
 import { AppModule } from './app.module'
 
 // ===== BOOTSTRAP =====
@@ -16,7 +16,7 @@ async function bootstrap() {
   console.log(`   maxPages     = ${CONFIG.maxPages}`)
   console.log(`   maxTx        = ${CONFIG.pageSize * CONFIG.maxPages}`)
   console.log(`   cacheTTL     = ${CONFIG.cacheTtlMs / 60_000} мин`)
-  console.log(`   CEX-адресов  = ${CEX_ADDRESSES.size}`)
+  console.log(`   известных адресов = ${KNOWN_ADDRESSES.size} (бирж и протоколов ${SERVICE_ADDRESSES.size})`)
   console.log(`\n   GET /health`)
   console.log(`   GET /graph/wallet/:address`)
   console.log(`   GET /graph/token/:address`)

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { GraphController } from '../src/controllers/graph.controller'
-import { CEX_ADDRESSES } from '../src/constants/cex-addresses'
+import { SERVICE_ADDRESSES } from '../src/constants/known-addresses'
 import type { EtherscanService } from '../src/services/etherscan.service'
 import type { GraphBuilderService } from '../src/services/graph-builder.service'
 import type { ClusterService } from '../src/services/cluster.service'
@@ -20,7 +20,7 @@ function controllerWith(etherscan: Partial<Record<keyof EtherscanService, unknow
 }
 
 const root = addr(0x100)
-const cex  = [...CEX_ADDRESSES.keys()][0]
+const cex  = [...SERVICE_ADDRESSES.keys()][0]
 
 describe('GraphController: выбор контрагентов для 2-го хопа', () => {
   it('сортирует по объёму ETH и пропускает биржи и контракты', async () => {
@@ -64,17 +64,29 @@ describe('GraphController: капитализация группы', () => {
     gr: {} as ClusterInfo['gr'], markov: {} as ClusterInfo['markov'], behavior: {},
   }
 
-  it('исключает контракты и сервисные кошельки, но не сам кошелёк', async () => {
+  it('находит контракты и сервисные кошельки, но не трогает сам кошелёк', async () => {
     const getHighActivity = vi.fn(async (list: string[]) => new Set(list.filter(a => a === service || a === root)))
-    const controller = controllerWith({
-      getContracts:  async (list: string[]) => new Set(list.filter(a => a === contract)),
-      getHighActivity,
-      getBalances:   async () => new Map(),
-    })
+    const getContracts    = vi.fn(async (list: string[]) => new Set(list.filter(a => a === contract)))
+    const controller = controllerWith({ getContracts, getHighActivity })
+
+    const hints = await controller['detectWalletHints'](root, [root, friend, contract, service, small], transactions, balances())
+
+    expect([...hints.contracts!]).toEqual([contract])
+    expect([...hints.services!]).toEqual([service])
+    // отправители обычных tx — заведомо кошельки, на контракт их не проверяем
+    expect(getContracts.mock.calls[0][0]).toEqual([contract, small])
+    expect(getHighActivity.mock.calls[0][0]).not.toContain(root)
+    // проверенные кошельки: отправители tx + проверенные не-контракты
+    expect([...hints.verified!].sort()).toEqual([root, friend, service, small].sort())
+  })
+
+  it('исключает из капитализации контракты и сервисные кошельки', async () => {
+    const controller = controllerWith({ getBalances: async () => new Map(), getContracts: async () => new Set<string>() })
+    const hints = { contracts: new Set([contract]), services: new Set([service]), verified: new Set([root, friend]) }
 
     const cap = await controller['computeCapitalization'](
-      root, [root, friend, contract, service, small], transactions, balances(),
-      new Map([[root, cluster], [friend, cluster]]), 2000,
+      root, [root, friend, contract, service, small], balances(),
+      new Map([[root, cluster], [friend, cluster]]), 2000, hints,
     )
 
     expect(cap.fullEth).toBe(15.5)        // root 10 + friend 5 + small 0.5
@@ -83,22 +95,21 @@ describe('GraphController: капитализация группы', () => {
     expect(cap.clusterUsd).toBe(30_000)
     expect(cap.excludedContracts).toBe(1)
     expect(cap.excludedServices).toBe(1)
-    expect(getHighActivity.mock.calls[0][0]).not.toContain(root)
   })
 
-  it('догружает балансы участников кластера, которых нет в графе', async () => {
-    const outside = addr(9)
-    const getBalances = vi.fn(async () => new Map([[outside, 2]]))
-    const controller = controllerWith({
-      getContracts: async () => new Set<string>(), getHighActivity: async () => new Set<string>(), getBalances,
-    })
-    const wide = { ...cluster, addresses: [root, outside] }
+  it('догружает участников кластера вне графа и проверяет их на контракт', async () => {
+    const [outside, outsideContract] = [addr(9), addr(10)]
+    const getBalances  = vi.fn(async () => new Map([[outside, 2], [outsideContract, 7]]))
+    const getContracts = vi.fn(async (list: string[]) => new Set(list.filter(a => a === outsideContract)))
+    const controller = controllerWith({ getBalances, getContracts })
+    const wide = { ...cluster, addresses: [root, outside, outsideContract] }
 
     const cap = await controller['computeCapitalization'](
-      root, [root], [tx(outside, root, 1)], new Map([[root, 10]]), new Map([[root, wide]]), 2000,
+      root, [root], new Map([[root, 10]]), new Map([[root, wide]]), 2000, { verified: new Set([root]) },
     )
 
-    expect(getBalances).toHaveBeenCalledWith([outside])
-    expect(cap.clusterEth).toBe(12)
+    expect(getBalances).toHaveBeenCalledWith([outside, outsideContract])
+    expect(getContracts).toHaveBeenCalledWith([outside, outsideContract])
+    expect(cap.clusterEth).toBe(12)       // root 10 + outside 2, контракт не считается
   })
 })

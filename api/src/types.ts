@@ -1,3 +1,5 @@
+import type { EntityType } from './constants/known-addresses'
+
 // ===== ТИПЫ =====
 
 export interface EtherscanTransaction {
@@ -21,6 +23,9 @@ export interface GraphNode {
   balanceKnown: boolean       // false — реальный баланс ETH не запрашивался (граф токена)
   tokenFlow?: number          // граф токена: приход − расход токена в загруженных переводах
   tokenSymbol?: string
+  entityType: EntityType       // категория владельца (легенда «Владелец»)
+  entityName?: string         // название (Binance, Uniswap…) или роль («смарт-контракт», «создатель токена»)
+  entityVerified?: boolean    // для кошелька: проверено, что это не контракт
   isExchange: boolean
   exchangeName?: string
   clusterId?: string

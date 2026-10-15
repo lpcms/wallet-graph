@@ -10,6 +10,7 @@ import { inferSettings } from 'graphology-layout-forceatlas2'
 import forceAtlas2Worker from 'graphology-layout-forceatlas2/worker.js'
 
 import type { Node, Link, GrowthReadiness, MarkovPhase } from '../types/graph'
+import { ENTITY_ORDER, ENTITY_STYLES, entityStyle } from '../lib/entities'
 
 const FA2Supervisor =
   'default' in forceAtlas2Worker
@@ -62,7 +63,21 @@ function clusterColor(clusterId: string): { color: string; border: string } {
 }
 
 // ===== ЦВЕТ УЗЛА =====
-function getNodeColor(node: Node): { color: string; borderColor: string } {
+// owner    — по категории владельца (кошелёк, биржа, фонд…), кластер виден по цвету обводки
+// behavior — по поведению: покупатели, продавцы, пустые, кластеры
+type ColorMode = 'owner' | 'behavior'
+
+function getNodeColor(node: Node, mode: ColorMode): { color: string; borderColor: string } {
+  return mode === 'owner' ? getOwnerColor(node) : getBehaviorColor(node)
+}
+
+function getOwnerColor(node: Node): { color: string; borderColor: string } {
+  const style = entityStyle(node.entityType)
+  const inCluster = node.clusterId && (node.clusterSize ?? 1) > 1
+  return { color: style.color, borderColor: inCluster ? clusterColor(node.clusterId!).color : style.border }
+}
+
+function getBehaviorColor(node: Node): { color: string; borderColor: string } {
   // Биржи — серые полупрозрачные
   if (node.isExchange || node.nodeType === 'EXCHANGE')
     return { color: '#94a3b8', borderColor: '#cbd5e1' }
@@ -85,11 +100,11 @@ function getNodeColor(node: Node): { color: string; borderColor: string } {
 }
 
 // ===== ЦВЕТ РЕБРА =====
-function getEdgeColor(link: Link, nodes: Node[]): string {
+function getEdgeColor(link: Link, nodesById: Map<string, Node>): string {
   // Межкластерное ребро — белое/яркое, чтобы выделялось
   if (link.isCrossCluster) return '#ffffff'
 
-  const src = nodes.find(n => n.id === link.sourceId)
+  const src = nodesById.get(link.sourceId)
   // Если оба конца — один кластер, берём его цвет (бледнее)
   if (src?.clusterId && (src.clusterSize ?? 1) > 1) {
     return clusterColor(src.clusterId).border
@@ -262,8 +277,8 @@ interface Props {
   links: Link[]
 }
 
-// Легенда
-const LEGEND_ITEMS = [
+// Легенда режима «Поведение»
+const BEHAVIOR_LEGEND = [
   { color: '#22c55e', label: 'Buyers'    },
   { color: '#ef4444', label: 'Sellers'   },
   { color: '#3b82f6', label: 'Active'    },
@@ -278,8 +293,27 @@ export default function WalletGraph({ nodes, links }: Props) {
   const sigmaRef     = useRef<Sigma | null>(null)
   const fa2Ref       = useRef<InstanceType<typeof FA2Supervisor> | null>(null)
 
+  const graphRef     = useRef<MultiGraph | null>(null)
+
   const [isPlayed,     setIsPlayed]     = useState(false)
   const [selectedNode, setSelectedNode] = useState<Node | null>(null)
+  const [colorMode,    setColorMode]    = useState<ColorMode>('owner')
+  // Текущий режим для инициализации графа — без перестроения графа при переключении
+  const colorModeRef = useRef<ColorMode>(colorMode)
+
+  // Сколько узлов каждой категории — счётчики легенды «Владелец»
+  const entityCounts = useMemo(() => {
+    const counts = new Map<string, number>()
+    nodes.forEach(n => {
+      const type = ENTITY_STYLES[n.entityType as keyof typeof ENTITY_STYLES] ? n.entityType! : 'UNATTRIBUTED'
+      counts.set(type, (counts.get(type) ?? 0) + 1)
+    })
+    return counts
+  }, [nodes])
+  const verifiedWallets = useMemo(
+    () => nodes.filter(n => n.entityType === 'WALLET' && n.entityVerified).length,
+    [nodes],
+  )
 
   // Считаем уникальные кластеры для мини-легенды кластеров
   const clusterList = useMemo(() => {
@@ -302,9 +336,10 @@ export default function WalletGraph({ nodes, links }: Props) {
     if (!containerRef.current || !nodes.length) return
 
     const graph = new MultiGraph()
+    const nodesById = new Map(nodes.map(n => [n.id, n]))
 
     nodes.forEach((node) => {
-      const { color, borderColor } = getNodeColor(node)
+      const { color, borderColor } = getNodeColor(node, colorModeRef.current)
       graph.addNode(node.id, {
         size:        getNodeSize(node),
         label:       shortAddress(node.walletAddress),
@@ -325,7 +360,7 @@ export default function WalletGraph({ nodes, links }: Props) {
       ) {
         graph.addEdgeWithKey(edgeId, link.sourceId, link.targetId, {
           size:  link.isCrossCluster ? 2.5 : 1.5,
-          color: getEdgeColor(link, nodes),
+          color: getEdgeColor(link, nodesById),
           link,
         })
       }
@@ -358,6 +393,7 @@ export default function WalletGraph({ nodes, links }: Props) {
     sigma.on('clickStage', () => setSelectedNode(null))
 
     sigmaRef.current = sigma
+    graphRef.current = graph
 
     const fa2 = new FA2Supervisor(graph, {
       settings: { ...inferSettings(graph), gravity: 0.5, slowDown: 30 },
@@ -368,6 +404,15 @@ export default function WalletGraph({ nodes, links }: Props) {
 
     return () => { fa2.stop(); sigma.kill() }
   }, [nodes, links])
+
+  // Переключение режима цвета — перекрашиваем узлы без перестроения графа и раскладки
+  useEffect(() => {
+    colorModeRef.current = colorMode
+    graphRef.current?.updateEachNodeAttributes((_, attrs) => {
+      const { color, borderColor } = getNodeColor(attrs.node as Node, colorMode)
+      return { ...attrs, color, borderColor }
+    })
+  }, [colorMode])
 
   const toggleLayout = () => {
     if (!fa2Ref.current) return
@@ -403,14 +448,55 @@ export default function WalletGraph({ nodes, links }: Props) {
         <button onClick={zoomIn} title="Увеличить" style={{ ...btnBase, height: 34, fontSize: 20, lineHeight: '32px', textAlign: 'center', padding: 0 }}>+</button>
         <button onClick={zoomOut} title="Уменьшить" style={{ ...btnBase, height: 34, fontSize: 20, lineHeight: '32px', textAlign: 'center', padding: 0 }}>−</button>
 
-        {/* Легенда типов */}
+        {/* Легенда: переключатель режима цвета + категории */}
         <div style={{ background: 'rgba(255,255,255,0.92)', border: '1px solid #d1d5db', borderRadius: 8, padding: '8px 12px', marginTop: 2 }}>
-          {LEGEND_ITEMS.map(item => (
-            <div key={item.label} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
-              <div style={{ width: 10, height: 10, borderRadius: '50%', background: item.color, flexShrink: 0 }} />
-              <span style={{ fontSize: 11, color: '#1e293b', whiteSpace: 'nowrap' }}>{item.label}</span>
+          <div style={{ display: 'flex', gap: 4, marginBottom: 8 }}>
+            {([['owner', 'Владелец'], ['behavior', 'Поведение']] as const).map(([mode, label]) => (
+              <button
+                key={mode}
+                onClick={() => setColorMode(mode)}
+                style={{
+                  flex: 1, padding: '3px 8px', fontSize: 11, borderRadius: 6, cursor: 'pointer',
+                  border: '1px solid #cbd5e1',
+                  background: colorMode === mode ? '#1e293b' : '#ffffff',
+                  color:      colorMode === mode ? '#ffffff' : '#1e293b',
+                  fontWeight: colorMode === mode ? 600 : 400,
+                }}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+
+          {colorMode === 'owner'
+            ? ENTITY_ORDER.map(type => {
+                const count = entityCounts.get(type) ?? 0
+                return (
+                  <div key={type} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4, opacity: count ? 1 : 0.4 }}>
+                    <div style={{ width: 10, height: 10, borderRadius: '50%', background: ENTITY_STYLES[type].color, flexShrink: 0 }} />
+                    <span style={{ fontSize: 11, color: '#1e293b', whiteSpace: 'nowrap', flex: 1 }}>{ENTITY_STYLES[type].label}</span>
+                    <span
+                      style={{ fontSize: 11, color: '#64748b', marginLeft: 8 }}
+                      title={type === 'WALLET' ? 'Проверено, что это не контракт: самые активные и крупные адреса; остальные считаются кошельками без проверки' : undefined}
+                    >
+                      {count.toLocaleString('ru-RU')}
+                      {type === 'WALLET' && count > 0 ? ` (проверено ${verifiedWallets.toLocaleString('ru-RU')})` : ''}
+                    </span>
+                  </div>
+                )
+              })
+            : BEHAVIOR_LEGEND.map(item => (
+                <div key={item.label} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+                  <div style={{ width: 10, height: 10, borderRadius: '50%', background: item.color, flexShrink: 0 }} />
+                  <span style={{ fontSize: 11, color: '#1e293b', whiteSpace: 'nowrap' }}>{item.label}</span>
+                </div>
+              ))}
+
+          {colorMode === 'owner' && clusterList.length > 0 && (
+            <div style={{ fontSize: 10, color: '#64748b', marginTop: 4, maxWidth: 190, lineHeight: 1.4 }}>
+              Цветная обводка — адрес входит в кластер
             </div>
-          ))}
+          )}
         </div>
 
         {/* Мини-легенда кластеров (только если есть) */}
@@ -459,7 +545,7 @@ export default function WalletGraph({ nodes, links }: Props) {
             height: 3, borderRadius: 2, marginBottom: 10,
             background: isClusterNode
               ? clusterColor(selectedNode.clusterId!).color
-              : getNodeColor(selectedNode).color,
+              : getNodeColor(selectedNode, colorMode).color,
           }} />
 
           {/* Метка */}
@@ -479,6 +565,17 @@ export default function WalletGraph({ nodes, links }: Props) {
           </a>
 
           <div style={{ borderTop: '1px solid #e2e8f0', marginBottom: 10 }} />
+
+          {/* Владелец: категория + название или роль */}
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 8, fontSize: 13, marginBottom: 7 }}>
+            <span style={{ color: '#64748b' }}>Владелец</span>
+            <span style={{ display: 'flex', alignItems: 'center', gap: 6, fontWeight: 600, color: '#1e293b', textAlign: 'right' }}>
+              <span style={{ width: 9, height: 9, borderRadius: '50%', background: entityStyle(selectedNode.entityType).color, flexShrink: 0 }} />
+              {entityStyle(selectedNode.entityType).label}
+              {selectedNode.entityName ? ` · ${selectedNode.entityName}` : ''}
+              {selectedNode.entityType === 'WALLET' ? (selectedNode.entityVerified ? ' · проверен' : ' · не проверен') : ''}
+            </span>
+          </div>
 
           {/* Строки: базовые */}
           {[
@@ -590,16 +687,6 @@ export default function WalletGraph({ nodes, links }: Props) {
             </>
           )}
 
-          {/* Биржа */}
-          {selectedNode.isExchange && selectedNode.exchangeName && (
-            <>
-              <div style={{ borderTop: '1px solid #e2e8f0', margin: '8px 0' }} />
-              <div style={{ fontSize: 12, color: '#64748b', display: 'flex', justifyContent: 'space-between' }}>
-                <span>Биржа</span>
-                <span style={{ fontWeight: 600, color: '#1e293b' }}>{selectedNode.exchangeName}</span>
-              </div>
-            </>
-          )}
 
           <button
             onClick={() => setSelectedNode(null)}

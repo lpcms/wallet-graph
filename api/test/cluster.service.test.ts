@@ -79,3 +79,25 @@ describe('ClusterService: K-means группы', () => {
     }
   })
 })
+
+describe('ClusterService: контракты не склеивают посторонних', () => {
+  // Два независимых трейдера дважды за полчаса меняются с одним пулом — эвристика
+  // «взаимные переводы» без исключения сделала бы трейдеров и пул одним владельцем
+  const [traderA, traderB, pool] = [addr(0xa1), addr(0xb1), addr(0xfee)]
+  const t0 = 1_700_000_000
+  const txs = [traderA, traderB].flatMap((t, k) => [
+    tx(t, pool, 1, 1, t0 + k * 10_000), tx(pool, t, 1, 1, t0 + k * 10_000 + 60),
+    tx(t, pool, 1, 2, t0 + k * 10_000 + 120), tx(pool, t, 1, 2, t0 + k * 10_000 + 180),
+  ])
+  const build = (excluded?: Set<string>) =>
+    new ClusterService().buildClusters(txs, new Map(), 2000, new AnalyticsService(), false, excluded)
+
+  it('без исключения пул связывает трейдеров (так было)', () => {
+    expect(build().get(traderA)!.addresses).toHaveLength(3)
+  })
+
+  it('найденный контракт исключается — каждый остаётся сам по себе', () => {
+    const clusters = build(new Set([pool]))
+    for (const a of [traderA, traderB, pool]) expect(clusters.get(a)!.addresses).toEqual([a])
+  })
+})

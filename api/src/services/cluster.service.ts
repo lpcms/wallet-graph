@@ -1,5 +1,5 @@
 import { Injectable } from '@nestjs/common'
-import { CEX_ADDRESSES } from '../constants/cex-addresses'
+import { SERVICE_ADDRESSES } from '../constants/known-addresses'
 import type { EtherscanTransaction, GrowthReadiness, MarkovPhase, ClusterInfo, AddressFeatures, BehaviorProfile } from '../types'
 import { kmeans } from 'ml-kmeans'
 import { txAmount } from '../lib/amount'
@@ -38,9 +38,10 @@ export class ClusterService {
   private buildFeatures(
     transactions: EtherscanTransaction[],
     realBalances: Map<string, number>,
+    excluded: Set<string>,
   ): Map<string, AddressFeatures> {
 
-    const isCex = (addr: string) => CEX_ADDRESSES.has(addr.toLowerCase())
+    const isCex = (addr: string) => SERVICE_ADDRESSES.has(addr.toLowerCase()) || excluded.has(addr.toLowerCase())
     const result = new Map<string, AddressFeatures>()
 
     // Собираем транзакции по каждому адресу
@@ -207,8 +208,9 @@ export class ClusterService {
   private applyHeuristics(
     uf: UnionFind,
     transactions: EtherscanTransaction[],
+    excluded: Set<string>,
   ): void {
-    const isCex = (addr: string) => CEX_ADDRESSES.has(addr.toLowerCase())
+    const isCex = (addr: string) => SERVICE_ADDRESSES.has(addr.toLowerCase()) || excluded.has(addr.toLowerCase())
 
     // Эвристика 1: Dust sweep
     // Один адрес рассылает < 0.001 ETH на 5+ адресов в течение 30 минут.
@@ -325,10 +327,13 @@ export class ClusterService {
     ethPriceUsd: number,
     analyticsService: AnalyticsService,
     skipAnalytics = false,  // true для больших наборов — пропускаем GR/Markov для одиночных
+    // Найденные контракты и сервисные кошельки: как и биржи, не могут быть «одним владельцем»
+    // с кошельками — через пул DEX проходят сделки тысяч посторонних людей
+    excluded: Set<string> = new Set(),
   ): Map<string, ClusterInfo> {
 
     // ── 1. Вектор фич + нормализация ─────────────────────────────────
-    const featMap              = this.buildFeatures(transactions, realBalances)
+    const featMap              = this.buildFeatures(transactions, realBalances, excluded)
     const { addresses, matrix } = this.normalize(featMap)
 
     // ── 2. K-means: определяем оптимальное K (макс. 8, не больше N/3) ─
@@ -372,7 +377,7 @@ export class ClusterService {
     }
 
     // ── 3. Union-Find эвристики (dust, funded, взаимные) ─────────────
-    this.applyHeuristics(uf, transactions)
+    this.applyHeuristics(uf, transactions, excluded)
 
     // ── 4. Собираем итоговые кластеры ─────────────────────────────────
     const rawClusters = uf.getClusters()

@@ -1,7 +1,8 @@
 import { Injectable } from '@nestjs/common'
-import { CEX_ADDRESSES } from '../constants/cex-addresses'
+import { SERVICE_ADDRESSES } from '../constants/known-addresses'
 import type { EtherscanTransaction, GraphNode, GraphLink, ClusterInfo } from '../types'
 import { isTokenTransfer, txAmount } from '../lib/amount'
+import { classifyAddress, type EntityHints } from '../lib/entities'
 
 // ===== ГРАФ-БИЛДЕР =====
 
@@ -51,6 +52,7 @@ export class GraphBuilderService {
     realBalances: Map<string, number>,
     ethPriceUsd: number,
     clusterMap: Map<string, ClusterInfo>,
+    entityHints: EntityHints = {},
   ): { nodes: GraphNode[]; links: GraphLink[] } {
 
     const addressMap = new Map<string, string>()
@@ -79,8 +81,9 @@ export class GraphBuilderService {
         : !tokenTx ? Math.max(0, addrStats.netFlow)
         : undefined
       const usdAmount    = (ethBalance ?? 0) * ethPriceUsd
-      const exchangeName = CEX_ADDRESSES.get(address.toLowerCase())
+      const exchangeName = SERVICE_ADDRESSES.get(address.toLowerCase())
       const isExchange   = !!exchangeName
+      const entity       = classifyAddress(address, entityHints)
       const cluster      = clusterMap.get(address.toLowerCase())
 
       nodes.push({
@@ -92,6 +95,9 @@ export class GraphBuilderService {
         usdValue:      `$${usdAmount.toFixed(2)}`,
         balanceKnown:  ethBalance !== undefined,
         ...(tokenTx && { tokenFlow: addrStats.netFlow, tokenSymbol }),
+        entityType:    entity.type,
+        entityName:    entity.name,
+        ...(entity.type === 'WALLET' && { entityVerified: entity.verified }),
         isExchange,
         exchangeName,
         clusterId:     cluster?.clusterId,

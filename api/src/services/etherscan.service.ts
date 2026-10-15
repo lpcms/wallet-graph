@@ -84,21 +84,26 @@ export class EtherscanService {
   // Какие из адресов — смарт-контракты (getcontractcreation, до 5 адресов за запрос).
   // Обычные кошельки (EOA) Etherscan в ответе просто не возвращает.
   async getContracts(addresses: string[]): Promise<Set<string>> {
-    const contracts = new Set<string>()
+    return new Set((await this.getContractCreators(addresses)).keys())
+  }
+
+  // Контракт → адрес его создателя. Кошельки (EOA, в т.ч. с делегированием EIP-7702) в ответ не попадают
+  async getContractCreators(addresses: string[]): Promise<Map<string, string>> {
+    const creators = new Map<string, string>()
     const chunks: string[][] = []
     for (let i = 0; i < addresses.length; i += 5) chunks.push(addresses.slice(i, i + 5))
 
     await Promise.all(chunks.map(async chunk => {
-      const data = await this.request<{ contractAddress: string }[] | string | null>({
+      const data = await this.request<{ contractAddress: string; contractCreator: string }[] | string | null>({
         module: 'contract', action: 'getcontractcreation', contractaddresses: chunk.join(','),
       })
       if (data.status === '1' && Array.isArray(data.result)) {
-        data.result.forEach(r => contracts.add(r.contractAddress.toLowerCase()))
+        data.result.forEach(r => creators.set(r.contractAddress.toLowerCase(), r.contractCreator?.toLowerCase() ?? ''))
       } else if (data.message !== 'No data found') {
         console.log(`  [Contracts] ошибка проверки ${chunk.length} адресов: ${data.message} ${JSON.stringify(data.result)}`)
       }
     }))
-    return contracts
+    return creators
   }
 
   // Адреса с 10 000+ обычных tx: у такого адреса существует 10 000-я tx (page=10000, offset=1 —

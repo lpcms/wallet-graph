@@ -47,6 +47,9 @@ export interface Node {
   usdBalance: string
   usdValue?: string
   balanceKnown?: boolean   // false — реальный баланс ETH не запрашивался (граф токена)
+  entityType?: string      // категория владельца: WALLET, CEX, DEX, FUND, DEFI, ISSUER, PERSON, UNATTRIBUTED
+  entityName?: string      // название (Binance, Uniswap…) или роль («смарт-контракт»)
+  entityVerified?: boolean // для кошелька: проверено, что это не контракт
   tokenFlow?: number       // граф токена: приход − расход токена
   tokenSymbol?: string
   weightedAverageBuyPrice?: number
