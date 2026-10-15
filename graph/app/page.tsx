@@ -40,6 +40,8 @@ export default function Home() {
   const [error, setError]       = useState('')
   const [info, setInfo]         = useState('')
   const [ticker, setTicker]     = useState('')
+  // Адрес в центре графа: исследуемый кошелёк (в режиме токена — самый связанный узел)
+  const [center, setCenter]     = useState('')
 
   // Накопительный режим
   const [fullMode, setFullMode] = useState(false)
@@ -71,6 +73,7 @@ export default function Home() {
         setNodes([]); setLinks([])
       } else {
         setNodes(data.nodes)
+        setCenter(mode === 'wallet' ? input.trim().toLowerCase() : '')
         setLinks(data.links)
         if (mode === 'token' && data.ticker) setTicker(data.ticker)
         const cap: Capitalization | undefined = data.capitalization
@@ -116,6 +119,7 @@ export default function Home() {
       }
       if (data.type === 'done') {
         setNodes(data.nodes ?? [])
+        setCenter('')
         setLinks(data.links ?? [])
         if (data.ticker) setTicker(data.ticker)
         setInfo(`Загружено: ${data.nodesCount} кошельков, ${data.totalTransactions} транзакций`)
@@ -386,7 +390,7 @@ export default function Home() {
       </div>
 
       {/* Граф */}
-      {nodes.length > 0 && <WalletGraph nodes={nodes} links={links} />}
+      {nodes.length > 0 && <WalletGraph nodes={nodes} links={links} centerAddress={center || undefined} />}
     </main>
   )
 }

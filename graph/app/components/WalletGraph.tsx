@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, useMemo } from 'react'
 import { MultiGraph } from 'graphology'
-import { random } from 'graphology-layout'
+
 import Sigma from 'sigma'
 import { EdgeRectangleProgram } from 'sigma/rendering'
 import { createNodeBorderProgram } from '@sigma/node-border'
@@ -11,6 +11,7 @@ import forceAtlas2Worker from 'graphology-layout-forceatlas2/worker.js'
 
 import type { Node, Link, GrowthReadiness, MarkovPhase } from '../types/graph'
 import { ENTITY_ORDER, ENTITY_STYLES, entityStyle } from '../lib/entities'
+import { findIslands, hubLayout, type Point } from '../lib/graph-layout'
 
 const FA2Supervisor =
   'default' in forceAtlas2Worker
@@ -275,7 +276,21 @@ const ROLE_LABEL: Record<string, string> = {
 interface Props {
   nodes: Node[]
   links: Link[]
+  centerAddress?: string   // исследуемый кошелёк — в центре раскладки
 }
+
+// Масштаб — по видимым узлам: sigma учитывает и скрытые, и скрытые острова оставляли бы пустоту
+function fitVisible(sigma: Sigma, positions: Map<string, Point>, hidden: Set<string> | null) {
+  if (!hidden?.size) { sigma.setCustomBBox(null); return }
+  const xs: number[] = [], ys: number[] = []
+  positions.forEach((p, id) => { if (!hidden.has(id)) { xs.push(p.x); ys.push(p.y) } })
+  if (!xs.length) { sigma.setCustomBBox(null); return }
+  sigma.setCustomBBox({ x: [Math.min(...xs), Math.max(...xs)], y: [Math.min(...ys), Math.max(...ys)] })
+}
+
+// Центральный адрес выделяется размером и белой обводкой
+const CENTER_SIZE   = 20
+const CENTER_BORDER = '#ffffff'
 
 // Легенда режима «Поведение»
 const BEHAVIOR_LEGEND = [
@@ -288,18 +303,30 @@ const BEHAVIOR_LEGEND = [
 ]
 
 // ===== КОМПОНЕНТ =====
-export default function WalletGraph({ nodes, links }: Props) {
+export default function WalletGraph({ nodes, links, centerAddress }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const sigmaRef     = useRef<Sigma | null>(null)
   const fa2Ref       = useRef<InstanceType<typeof FA2Supervisor> | null>(null)
 
   const graphRef     = useRef<MultiGraph | null>(null)
+  const layoutRef    = useRef<Map<string, Point> | null>(null)
 
   const [isPlayed,     setIsPlayed]     = useState(false)
   const [selectedNode, setSelectedNode] = useState<Node | null>(null)
   const [colorMode,    setColorMode]    = useState<ColorMode>('owner')
   // Текущий режим для инициализации графа — без перестроения графа при переключении
   const colorModeRef = useRef<ColorMode>(colorMode)
+
+  const centerId = useMemo(
+    () => centerAddress
+      ? nodes.find(n => n.walletAddress.toLowerCase() === centerAddress.toLowerCase())?.id
+      : undefined,
+    [nodes, centerAddress],
+  )
+  // Острова — адреса без связи с главной группой ни одной цепочкой переводов; по умолчанию показаны
+  const islands = useMemo(() => findIslands(nodes.map(n => n.id), links, centerId), [nodes, links, centerId])
+  const [showIslands, setShowIslands] = useState(true)
+  const showIslandsRef = useRef(showIslands)
 
   // Сколько узлов каждой категории — счётчики легенды «Владелец»
   const entityCounts = useMemo(() => {
@@ -338,14 +365,23 @@ export default function WalletGraph({ nodes, links }: Props) {
     const graph = new MultiGraph()
     const nodesById = new Map(nodes.map(n => [n.id, n]))
 
+    // Раскладка по группам: центр — исследуемый кошелёк (в режиме токена — самый связанный узел)
+    const positions = hubLayout(nodes.map(n => n.id), links, centerId)
+    layoutRef.current = positions
+
     nodes.forEach((node) => {
+      const isCenter = node.id === centerId
       const { color, borderColor } = getNodeColor(node, colorModeRef.current)
       graph.addNode(node.id, {
-        size:        getNodeSize(node),
+        ...positions.get(node.id),
+        size:        isCenter ? CENTER_SIZE : getNodeSize(node),
         label:       shortAddress(node.walletAddress),
+        forceLabel:  isCenter,
+        hidden:      islands.ids.has(node.id) && !showIslandsRef.current,
         node,
+        isCenter,
         color,
-        borderColor,
+        borderColor: isCenter ? CENTER_BORDER : borderColor,
         // Биржи полупрозрачны через opacity в label
         opacity:     (node.isExchange || node.nodeType === 'EXCHANGE') ? 0.4 : 1,
       })
@@ -365,8 +401,6 @@ export default function WalletGraph({ nodes, links }: Props) {
         })
       }
     })
-
-    random.assign(graph)
 
     const sigma = new Sigma(graph, containerRef.current, {
       defaultNodeType:            'bordered',
@@ -393,24 +427,35 @@ export default function WalletGraph({ nodes, links }: Props) {
     sigma.on('clickStage', () => setSelectedNode(null))
 
     sigmaRef.current = sigma
+    fitVisible(sigma, positions, showIslandsRef.current ? null : islands.ids)
     graphRef.current = graph
 
     const fa2 = new FA2Supervisor(graph, {
       settings: { ...inferSettings(graph), gravity: 0.5, slowDown: 30 },
     })
+    // Силовая раскладка сама не запускается — она сбила бы группы; включается кнопкой
     fa2Ref.current = fa2
-    fa2.start()
-    setTimeout(() => fa2.stop(), 1000)
+    setIsPlayed(false)
 
-    return () => { fa2.stop(); sigma.kill() }
-  }, [nodes, links])
+    return () => { fa2.kill(); sigma.kill() }
+  }, [nodes, links, centerId, islands])
+
+  // Показ/скрытие островов — без перестроения графа; масштаб подгоняется под видимое
+  useEffect(() => {
+    showIslandsRef.current = showIslands
+    const sigma = sigmaRef.current, positions = layoutRef.current
+    if (!sigma || !positions) return
+    graphRef.current?.updateEachNodeAttributes((id, attrs) => ({ ...attrs, hidden: islands.ids.has(id) && !showIslands }))
+    fitVisible(sigma, positions, showIslands ? null : islands.ids)
+    sigma.getCamera().animatedReset({ duration: 300 })
+  }, [showIslands, islands])
 
   // Переключение режима цвета — перекрашиваем узлы без перестроения графа и раскладки
   useEffect(() => {
     colorModeRef.current = colorMode
     graphRef.current?.updateEachNodeAttributes((_, attrs) => {
       const { color, borderColor } = getNodeColor(attrs.node as Node, colorMode)
-      return { ...attrs, color, borderColor }
+      return { ...attrs, color, borderColor: attrs.isCenter ? CENTER_BORDER : borderColor }
     })
   }, [colorMode])
 
@@ -419,6 +464,15 @@ export default function WalletGraph({ nodes, links }: Props) {
     if (isPlayed) fa2Ref.current.stop()
     else          fa2Ref.current.start()
     setIsPlayed(p => !p)
+  }
+
+  // Вернуть раскладку по группам (после ForceAtlas2) и показать граф целиком
+  const resetLayout = () => {
+    fa2Ref.current?.stop()
+    setIsPlayed(false)
+    const positions = layoutRef.current
+    graphRef.current?.updateEachNodeAttributes((id, attrs) => ({ ...attrs, ...positions?.get(id) }))
+    sigmaRef.current?.getCamera().animatedReset({ duration: 300 })
   }
 
   const zoomIn  = () => sigmaRef.current?.getCamera().animatedZoom({ duration: 300 })
@@ -444,6 +498,9 @@ export default function WalletGraph({ nodes, links }: Props) {
 
         <button onClick={toggleLayout} style={{ ...btnBase, padding: '6px 12px', fontSize: 13 }}>
           {isPlayed ? '⏸ Pause' : '▶ ForceAtlas2'}
+        </button>
+        <button onClick={resetLayout} title="Вернуть раскладку по группам" style={{ ...btnBase, padding: '6px 12px', fontSize: 13 }}>
+          ⟲ Группы
         </button>
         <button onClick={zoomIn} title="Увеличить" style={{ ...btnBase, height: 34, fontSize: 20, lineHeight: '32px', textAlign: 'center', padding: 0 }}>+</button>
         <button onClick={zoomOut} title="Уменьшить" style={{ ...btnBase, height: 34, fontSize: 20, lineHeight: '32px', textAlign: 'center', padding: 0 }}>−</button>
@@ -495,6 +552,35 @@ export default function WalletGraph({ nodes, links }: Props) {
           {colorMode === 'owner' && clusterList.length > 0 && (
             <div style={{ fontSize: 10, color: '#64748b', marginTop: 4, maxWidth: 190, lineHeight: 1.4 }}>
               Цветная обводка — адрес входит в кластер
+            </div>
+          )}
+
+          {/* Острова: группы адресов без связи с главной группой */}
+          {islands.groups > 0 && (
+            <div style={{ borderTop: '1px solid #e2e8f0', marginTop: 8, paddingTop: 8 }}>
+              <div
+                style={{ fontSize: 11, color: '#1e293b', marginBottom: 6, maxWidth: 190, lineHeight: 1.4 }}
+                title="Адреса, которые переводили только друг другу: с главной группой их не связывает ни один загруженный перевод"
+              >
+                Несвязанные группы: {islands.groups} ({islands.ids.size.toLocaleString('ru-RU')} адр.)
+              </div>
+              <div style={{ display: 'flex', gap: 4 }}>
+                {([[false, 'Скрыть'], [true, 'Показать']] as const).map(([show, label]) => (
+                  <button
+                    key={label}
+                    onClick={() => setShowIslands(show)}
+                    style={{
+                      flex: 1, padding: '3px 8px', fontSize: 11, borderRadius: 6, cursor: 'pointer',
+                      border: '1px solid #cbd5e1',
+                      background: showIslands === show ? '#1e293b' : '#ffffff',
+                      color:      showIslands === show ? '#ffffff' : '#1e293b',
+                      fontWeight: showIslands === show ? 600 : 400,
+                    }}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
             </div>
           )}
         </div>
