@@ -1,0 +1,26 @@
+# Зависимости и сборка
+node_modules/
+dist/
+.next/
+out/
+build/
+coverage/
+*.tsbuildinfo
+
+# Секреты: в репозиторий попадают только шаблоны .env.example
+.env
+.env.*
+!.env.example
+
+# Архивы и резервные копии (архив проекта — 190+ МБ, GitHub не примет файл больше 100 МБ)
+*.zip
+
+# Логи
+*.log
+npm-debug.log*
+
+# ОС и редакторы
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
