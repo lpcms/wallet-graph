@@ -64,6 +64,8 @@ export interface Node {
   clusterArchetype?: string
   kmeansSignals?: string[]
   // K-means: поведенческая группа адреса
+  hop?: number             // граф кошелька: число переводов от исследуемого кошелька (0 — он сам)
+  chainHop?: number        // шаг цепочки раскрытия, на котором адрес впервые встретился (≥ hop)
   behavior?: {
     group: number   // с 0
     k:     number   // всего групп

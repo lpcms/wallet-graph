@@ -53,6 +53,7 @@ export class GraphBuilderService {
     ethPriceUsd: number,
     clusterMap: Map<string, ClusterInfo>,
     entityHints: EntityHints = {},
+    assetPriceUsd: number | null = null,   // цена токена; для переводов ETH берётся ethPriceUsd
   ): { nodes: GraphNode[]; links: GraphLink[] } {
 
     const addressMap = new Map<string, string>()
@@ -118,6 +119,7 @@ export class GraphBuilderService {
       if (!sourceId || !targetId) return
 
       const amount         = txAmount(tx)
+      const price          = isTokenTransfer(tx) ? assetPriceUsd : ethPriceUsd
       const srcCluster     = clusterMap.get(tx.from.toLowerCase())?.clusterId
       const tgtCluster     = clusterMap.get(tx.to.toLowerCase())?.clusterId
       const isCrossCluster = !!(srcCluster && tgtCluster && srcCluster !== tgtCluster)
@@ -129,8 +131,8 @@ export class GraphBuilderService {
         targetAddress:     tx.to,
         linkType:          'TRANSFER',
         transactionWeight: amount,
-        // В долларах — только переводы ETH: цены токена у нас нет, а курс ETH к ней не относится
-        ...(!isTokenTransfer(tx) && { usdWeight: amount * ethPriceUsd }),
+        // В долларах — по цене самого актива; курс ETH к токену не относится, без цены токена веса нет
+        ...(price !== null && { usdWeight: amount * price }),
         unix:              Number(tx.timeStamp) * 1000,
         txId:              tx.hash,
         isCrossCluster,

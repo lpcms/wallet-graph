@@ -11,6 +11,7 @@ import forceAtlas2Worker from 'graphology-layout-forceatlas2/worker.js'
 
 import type { Node, Link, GrowthReadiness, MarkovPhase } from '../types/graph'
 import { ENTITY_ORDER, ENTITY_STYLES, entityStyle } from '../lib/entities'
+import { hopColor } from '../lib/hops'
 import { findIslands, hubLayout, type Point } from '../lib/graph-layout'
 
 const FA2Supervisor =
@@ -66,10 +67,18 @@ function clusterColor(clusterId: string): { color: string; border: string } {
 // ===== ЦВЕТ УЗЛА =====
 // owner    — по категории владельца (кошелёк, биржа, фонд…), кластер виден по цвету обводки
 // behavior — по поведению: покупатели, продавцы, пустые, кластеры
-type ColorMode = 'owner' | 'behavior'
+// hop      — по номеру хопа от исследуемого кошелька (граф кошелька), кластер — по обводке
+// chain    — по шагу цепочки раскрытия, на котором адрес впервые встретился
+type ColorMode = 'owner' | 'behavior' | 'hop' | 'chain'
 
 function getNodeColor(node: Node, mode: ColorMode): { color: string; borderColor: string } {
+  if (mode === 'hop' || mode === 'chain') return getHopColor(node, mode === 'chain' ? node.chainHop : node.hop)
   return mode === 'owner' ? getOwnerColor(node) : getBehaviorColor(node)
+}
+
+function getHopColor(node: Node, hop: number | undefined): { color: string; borderColor: string } {
+  const inCluster = node.clusterId && (node.clusterSize ?? 1) > 1
+  return { color: hopColor(hop), borderColor: inCluster ? clusterColor(node.clusterId!).color : '#334155' }
 }
 
 function getOwnerColor(node: Node): { color: string; borderColor: string } {
@@ -288,6 +297,13 @@ function fitVisible(sigma: Sigma, positions: Map<string, Point>, hidden: Set<str
   sigma.setCustomBBox({ x: [Math.min(...xs), Math.max(...xs)], y: [Math.min(...ys), Math.max(...ys)] })
 }
 
+// Сколько адресов на каждом хопе: [[хоп, число], …] по возрастанию хопа
+function countHops(nodes: Node[], pick: (n: Node) => number | undefined): [number, number][] {
+  const counts = new Map<number, number>()
+  nodes.forEach(n => { const h = pick(n); if (h !== undefined) counts.set(h, (counts.get(h) ?? 0) + 1) })
+  return [...counts.entries()].sort((a, b) => a[0] - b[0])
+}
+
 // Центральный адрес выделяется размером и белой обводкой
 const CENTER_SIZE   = 20
 const CENTER_BORDER = '#ffffff'
@@ -337,6 +353,17 @@ export default function WalletGraph({ nodes, links, centerAddress }: Props) {
     })
     return counts
   }, [nodes])
+  // Сколько адресов на каждом хопе — легенда режима «Хоп» (только граф кошелька)
+  const hopCounts   = useMemo(() => countHops(nodes, n => n.hop), [nodes])
+  const chainCounts = useMemo(() => countHops(nodes, n => n.chainHop), [nodes])
+  // В графе токена хопов нет — режим «Хоп» недоступен, показываем «Владелец»
+  const activeColorMode: ColorMode = (colorMode === 'hop' || colorMode === 'chain') && !hopCounts.length ? 'owner' : colorMode
+  // Кнопка «Хоп» активна в обоих вариантах хопа: кратчайший путь и шаг цепочки
+  const isModeActive = (mode: ColorMode) => activeColorMode === mode || (mode === 'hop' && activeColorMode === 'chain')
+  const colorModes: [ColorMode, string][] = [
+    ['owner', 'Владелец'], ['behavior', 'Поведение'], ...(hopCounts.length ? [['hop', 'Хоп'] as [ColorMode, string]] : []),
+  ]
+
   const verifiedWallets = useMemo(
     () => nodes.filter(n => n.entityType === 'WALLET' && n.entityVerified).length,
     [nodes],
@@ -452,12 +479,12 @@ export default function WalletGraph({ nodes, links, centerAddress }: Props) {
 
   // Переключение режима цвета — перекрашиваем узлы без перестроения графа и раскладки
   useEffect(() => {
-    colorModeRef.current = colorMode
+    colorModeRef.current = activeColorMode
     graphRef.current?.updateEachNodeAttributes((_, attrs) => {
-      const { color, borderColor } = getNodeColor(attrs.node as Node, colorMode)
+      const { color, borderColor } = getNodeColor(attrs.node as Node, activeColorMode)
       return { ...attrs, color, borderColor: attrs.isCenter ? CENTER_BORDER : borderColor }
     })
-  }, [colorMode])
+  }, [activeColorMode])
 
   const toggleLayout = () => {
     if (!fa2Ref.current) return
@@ -488,7 +515,7 @@ export default function WalletGraph({ nodes, links, centerAddress }: Props) {
 
   // ===== РЕНДЕР =====
   return (
-    <div style={{ position: 'relative', width: '100%', height: 'calc(100vh - 200px)', minHeight: '600px', background: '#1e293b', borderRadius: 12, overflow: 'hidden' }}>
+    <div style={{ position: 'relative', width: '100%', height: 'calc((100vh - 200px) * 1.2)', minHeight: '720px', background: '#1e293b', borderRadius: 12, overflow: 'hidden' }}>
 
       {/* Канвас */}
       <div ref={containerRef} style={{ width: '100%', height: '100%' }} />
@@ -508,16 +535,16 @@ export default function WalletGraph({ nodes, links, centerAddress }: Props) {
         {/* Легенда: переключатель режима цвета + категории */}
         <div style={{ background: 'rgba(255,255,255,0.92)', border: '1px solid #d1d5db', borderRadius: 8, padding: '8px 12px', marginTop: 2 }}>
           <div style={{ display: 'flex', gap: 4, marginBottom: 8 }}>
-            {([['owner', 'Владелец'], ['behavior', 'Поведение']] as const).map(([mode, label]) => (
+            {colorModes.map(([mode, label]) => (
               <button
                 key={mode}
                 onClick={() => setColorMode(mode)}
                 style={{
                   flex: 1, padding: '3px 8px', fontSize: 11, borderRadius: 6, cursor: 'pointer',
                   border: '1px solid #cbd5e1',
-                  background: colorMode === mode ? '#1e293b' : '#ffffff',
-                  color:      colorMode === mode ? '#ffffff' : '#1e293b',
-                  fontWeight: colorMode === mode ? 600 : 400,
+                  background: isModeActive(mode) ? '#1e293b' : '#ffffff',
+                  color:      isModeActive(mode) ? '#ffffff' : '#1e293b',
+                  fontWeight: isModeActive(mode) ? 600 : 400,
                 }}
               >
                 {label}
@@ -525,7 +552,7 @@ export default function WalletGraph({ nodes, links, centerAddress }: Props) {
             ))}
           </div>
 
-          {colorMode === 'owner'
+          {activeColorMode === 'owner'
             ? ENTITY_ORDER.map(type => {
                 const count = entityCounts.get(type) ?? 0
                 return (
@@ -542,6 +569,40 @@ export default function WalletGraph({ nodes, links, centerAddress }: Props) {
                   </div>
                 )
               })
+            : activeColorMode === 'hop' || activeColorMode === 'chain'
+            ? (
+              <>
+                {/* Какой номер хопа показывать */}
+                <div style={{ display: 'flex', gap: 4, marginBottom: 6 }}>
+                  {([['hop', 'Кратчайший путь'], ['chain', 'Шаг цепочки']] as const).map(([mode, label]) => (
+                    <button
+                      key={mode}
+                      onClick={() => setColorMode(mode)}
+                      title={mode === 'hop'
+                        ? 'Наименьшее число переводов от кошелька до адреса'
+                        : 'На каком шаге раскрытия хопов адрес впервые встретился'}
+                      style={{
+                        flex: 1, padding: '2px 6px', fontSize: 10, borderRadius: 6, cursor: 'pointer',
+                        border: '1px solid #cbd5e1',
+                        background: activeColorMode === mode ? '#475569' : '#ffffff',
+                        color:      activeColorMode === mode ? '#ffffff' : '#1e293b',
+                      }}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                {(activeColorMode === 'chain' ? chainCounts : hopCounts).map(([hop, count]) => (
+                  <div key={hop} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+                    <div style={{ width: 10, height: 10, borderRadius: '50%', background: hopColor(hop), border: '1px solid #cbd5e1', flexShrink: 0 }} />
+                    <span style={{ fontSize: 11, color: '#1e293b', whiteSpace: 'nowrap', flex: 1 }}>
+                      {hop === 0 ? 'Кошелёк' : `Хоп ${hop}`}
+                    </span>
+                    <span style={{ fontSize: 11, color: '#64748b', marginLeft: 8 }}>{count.toLocaleString('ru-RU')}</span>
+                  </div>
+                ))}
+              </>
+            )
             : BEHAVIOR_LEGEND.map(item => (
                 <div key={item.label} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
                   <div style={{ width: 10, height: 10, borderRadius: '50%', background: item.color, flexShrink: 0 }} />
@@ -549,7 +610,7 @@ export default function WalletGraph({ nodes, links, centerAddress }: Props) {
                 </div>
               ))}
 
-          {colorMode === 'owner' && clusterList.length > 0 && (
+          {activeColorMode !== 'behavior' && clusterList.length > 0 && (
             <div style={{ fontSize: 10, color: '#64748b', marginTop: 4, maxWidth: 190, lineHeight: 1.4 }}>
               Цветная обводка — адрес входит в кластер
             </div>
@@ -631,7 +692,7 @@ export default function WalletGraph({ nodes, links, centerAddress }: Props) {
             height: 3, borderRadius: 2, marginBottom: 10,
             background: isClusterNode
               ? clusterColor(selectedNode.clusterId!).color
-              : getNodeColor(selectedNode, colorMode).color,
+              : getNodeColor(selectedNode, activeColorMode).color,
           }} />
 
           {/* Метка */}
@@ -682,6 +743,21 @@ export default function WalletGraph({ nodes, links, centerAddress }: Props) {
               <span style={{ fontWeight: 600, color: row.green ? '#16a34a' : '#1e293b' }}>{row.value}</span>
             </div>
           ))}
+
+          {/* Хоп — сколько переводов от исследуемого кошелька */}
+          {selectedNode.hop !== undefined && (
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 13, marginBottom: 7 }}>
+              <span style={{ color: '#64748b' }}>Хоп</span>
+              <span style={{ fontWeight: 600, color: '#1e293b' }}>
+                {selectedNode.hop === 0
+                  ? 'исследуемый кошелёк'
+                  : `${selectedNode.hop} (переводов от кошелька)` +
+                    (selectedNode.chainHop !== undefined && selectedNode.chainHop !== selectedNode.hop
+                      ? `, по цепочке — ${selectedNode.chainHop}`
+                      : '')}
+              </span>
+            </div>
+          )}
 
           {/* Поведенческая группа K-means */}
           {selectedNode.behavior && (

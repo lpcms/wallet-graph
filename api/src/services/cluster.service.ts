@@ -3,6 +3,7 @@ import { SERVICE_ADDRESSES } from '../constants/known-addresses'
 import type { EtherscanTransaction, GrowthReadiness, MarkovPhase, ClusterInfo, AddressFeatures, BehaviorProfile } from '../types'
 import { kmeans } from 'ml-kmeans'
 import { txAmount } from '../lib/amount'
+import { thresholdsFor, type AmountThresholds } from '../lib/thresholds'
 import { UnionFind } from '../lib/union-find'
 import { AnalyticsService } from './analytics.service'
 
@@ -39,6 +40,7 @@ export class ClusterService {
     transactions: EtherscanTransaction[],
     realBalances: Map<string, number>,
     excluded: Set<string>,
+    thresholds: AmountThresholds,
   ): Map<string, AddressFeatures> {
 
     const isCex = (addr: string) => SERVICE_ADDRESSES.has(addr.toLowerCase()) || excluded.has(addr.toLowerCase())
@@ -67,8 +69,8 @@ export class ClusterService {
       const totalEth = txs.reduce((s, tx) => s + txAmount(tx), 0)
       const avgEthPerTx = txCount > 0 ? totalEth / txCount : 0
 
-      // [3] Доля пылевых транзакций (< 0.001 ETH)
-      const dustTx   = txs.filter(tx => txAmount(tx) < 0.001 && Number(tx.value) > 0)
+      // [3] Доля пылевых транзакций (дешевле DUST_USD)
+      const dustTx   = txs.filter(tx => txAmount(tx) < thresholds.dust && Number(tx.value) > 0)
       const dustRatio = txCount > 0 ? dustTx.length / txCount : 0
 
       // [4] Активные часы суток (уникальные, 0..24)
@@ -209,14 +211,15 @@ export class ClusterService {
     uf: UnionFind,
     transactions: EtherscanTransaction[],
     excluded: Set<string>,
+    thresholds: AmountThresholds,
   ): void {
     const isCex = (addr: string) => SERVICE_ADDRESSES.has(addr.toLowerCase()) || excluded.has(addr.toLowerCase())
 
     // Эвристика 1: Dust sweep
-    // Один адрес рассылает < 0.001 ETH на 5+ адресов в течение 30 минут.
+    // Один адрес рассылает переводы дешевле DUST_USD на 5+ адресов в течение 30 минут.
     // Объединяем только получателей между собой — отправитель не входит в кластер.
     {
-      const DUST_ETH    = 0.001
+      const DUST_ETH    = thresholds.dust   // в штуках актива
       const TIME_WINDOW = 1800  // 30 минут
       const MIN_BATCH   = 5
 
@@ -253,7 +256,7 @@ export class ClusterService {
     // Фандер отправил 2..20 адресам похожие суммы в течение 24 часов.
     // Объединяем только получателей между собой.
     {
-      const MIN_ETH     = 0.05   // минимальная сумма
+      const MIN_ETH     = thresholds.fundedMin   // FUNDED_MIN_USD в штуках актива
       const MAX_TARGETS = 20     // если > 20 — это биржа/роутер, не частный кошелёк
       const TIME_WINDOW = 86400  // 24 часа
 
@@ -330,10 +333,12 @@ export class ClusterService {
     // Найденные контракты и сервисные кошельки: как и биржи, не могут быть «одним владельцем»
     // с кошельками — через пул DEX проходят сделки тысяч посторонних людей
     excluded: Set<string> = new Set(),
+    // Пороги пыли и «общего источника» — в долларах по цене актива (без цены — прежние в штуках)
+    thresholds: AmountThresholds = thresholdsFor(null),
   ): Map<string, ClusterInfo> {
 
     // ── 1. Вектор фич + нормализация ─────────────────────────────────
-    const featMap              = this.buildFeatures(transactions, realBalances, excluded)
+    const featMap              = this.buildFeatures(transactions, realBalances, excluded, thresholds)
     const { addresses, matrix } = this.normalize(featMap)
 
     // ── 2. K-means: определяем оптимальное K (макс. 8, не больше N/3) ─
@@ -377,7 +382,7 @@ export class ClusterService {
     }
 
     // ── 3. Union-Find эвристики (dust, funded, взаимные) ─────────────
-    this.applyHeuristics(uf, transactions, excluded)
+    this.applyHeuristics(uf, transactions, excluded, thresholds)
 
     // ── 4. Собираем итоговые кластеры ─────────────────────────────────
     const rawClusters = uf.getClusters()
@@ -480,7 +485,7 @@ export class ClusterService {
             archetype: 'UNKNOWN',
             signals:   [],
             gr:        skipAnalytics ? emptyGR() : analyticsService.computeGR([addr], txs, realBalances),
-            markov:    skipAnalytics ? emptyMarkov() : analyticsService.computeMarkov([addr], txs),
+            markov:    skipAnalytics ? emptyMarkov() : analyticsService.computeMarkov([addr], txs, thresholds.inactive),
             behavior:  behaviorOf([addr]),
           })
         })
@@ -510,7 +515,7 @@ export class ClusterService {
       const withAnalytics = isMulti || !skipAnalytics
       const txs    = withAnalytics ? clusterTxs(addrs) : []
       const gr     = withAnalytics ? analyticsService.computeGR(addrs, txs, realBalances) : emptyGR()
-      const markov = withAnalytics ? analyticsService.computeMarkov(addrs, txs) : emptyMarkov()
+      const markov = withAnalytics ? analyticsService.computeMarkov(addrs, txs, thresholds.inactive) : emptyMarkov()
 
       const info: ClusterInfo = {
         clusterId: root,

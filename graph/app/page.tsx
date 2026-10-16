@@ -4,7 +4,8 @@ import dynamic from 'next/dynamic'
 import { useState } from 'react'
 import type { Node, Link } from './types/graph'
 import { API_URL } from './lib/api'
-import { formatUsd } from './lib/format'
+import { capitalizationText, formatPrice, type Capitalization } from './lib/format'
+import { clamp, estimateMinutes, HOPS_MAX, HOPS_MIN, WIDTH_MAX, WIDTH_MIN } from './lib/hops'
 
 const WalletGraph = dynamic(() => import('./components/WalletGraph'), { ssr: false })
 
@@ -24,11 +25,11 @@ interface PredictionResult {
 
 type SearchMode = 'wallet' | 'token'
 
-interface Capitalization {
-  fullUsd:          number
-  fullAddresses:    number
-  clusterUsd:       number
-  clusterAddresses: number
+
+// Поля «Хопов» и «Адресов на хоп»
+const numberInputStyle = {
+  width: 64, padding: '8px 10px', borderRadius: 8,
+  border: '1px solid #334155', background: '#1e293b', color: '#fff', fontSize: 14,
 }
 
 export default function Home() {
@@ -40,8 +41,14 @@ export default function Home() {
   const [error, setError]       = useState('')
   const [info, setInfo]         = useState('')
   const [ticker, setTicker]     = useState('')
+  // Цена токена с Binance (null — неизвестна, пороги эвристик в штуках токена)
+  const [tokenPrice, setTokenPrice] = useState<number | null | undefined>(undefined)
   // Адрес в центре графа: исследуемый кошелёк (в режиме токена — самый связанный узел)
   const [center, setCenter]     = useState('')
+
+  // Граф кошелька: сколько хопов раскрывать и сколько адресов на каждом
+  const [hops, setHops]         = useState(15)
+  const [hopWidth, setHopWidth] = useState(10)
 
   // Накопительный режим
   const [fullMode, setFullMode] = useState(false)
@@ -54,34 +61,28 @@ export default function Home() {
   const [predLoading, setPredLoading] = useState(false)
   const [predSymbol, setPredSymbol]   = useState('')
 
-  // ── Обычная загрузка ─────────────────────────────────────────────
+  // ── Граф токена ───────────────────────────────────────────────────
   const fetchGraph = async () => {
     if (!input.trim()) return
     setLoading(true)
     setError('')
     setInfo('')
     setTicker('')
+    setTokenPrice(undefined)
     setFullProgress(null)
     try {
-      const endpoint = mode === 'wallet'
-        ? `${API_URL}/graph/wallet/${input.trim()}`
-        : `${API_URL}/graph/token/${input.trim()}`
-      const res  = await fetch(endpoint)
+      const res  = await fetch(`${API_URL}/graph/token/${input.trim()}`)
       const data = await res.json()
       if (!data.nodes?.length) {
         setError(data.message || 'Данные не найдены')
         setNodes([]); setLinks([])
       } else {
         setNodes(data.nodes)
-        setCenter(mode === 'wallet' ? input.trim().toLowerCase() : '')
+        setCenter('')
         setLinks(data.links)
-        if (mode === 'token' && data.ticker) setTicker(data.ticker)
-        const cap: Capitalization | undefined = data.capitalization
-        const capText = cap
-          ? `, полная капитализация ${formatUsd(cap.fullUsd)}` +
-            `, кластер (${cap.clusterAddresses} адр.) ${formatUsd(cap.clusterUsd)}`
-          : ''
-        setInfo(`Загружено: ${data.nodes.length} кошельков, ${data.links.length} транзакций${capText}`)
+        if (data.ticker) setTicker(data.ticker)
+        setTokenPrice(data.assetPriceUsd ?? null)
+        setInfo(`Загружено: ${data.nodes.length} кошельков, ${data.links.length} транзакций`)
       }
     } catch {
       setError('Ошибка соединения с API')
@@ -96,6 +97,7 @@ export default function Home() {
     setError('')
     setInfo('')
     setTicker('')
+    setTokenPrice(undefined)
     setNodes([])
     setLinks([])
     setFullProgress({ page: 0, loaded: 0, message: 'Подключаемся...', done: false })
@@ -122,6 +124,7 @@ export default function Home() {
         setCenter('')
         setLinks(data.links ?? [])
         if (data.ticker) setTicker(data.ticker)
+        setTokenPrice(data.assetPriceUsd ?? null)
         setInfo(`Загружено: ${data.nodesCount} кошельков, ${data.totalTransactions} транзакций`)
         setFullProgress(prev => ({ ...prev!, done: true, message: 'Готово!' }))
         setLoading(false)
@@ -143,8 +146,57 @@ export default function Home() {
     }
   }
 
+  // ── Граф кошелька с прогрессом по хопам (SSE) ─────────────────────
+  const fetchWalletGraph = () => {
+    const address = input.trim()
+    if (!address) return
+    setLoading(true)
+    setError('')
+    setInfo('')
+    setTicker('')
+    setTokenPrice(undefined)
+    setFullProgress({ page: 0, loaded: 0, message: 'Подключаемся…', done: false })
+
+    const es = new EventSource(`${API_URL}/graph/wallet/${address}/stream?hops=${hops}&width=${hopWidth}`)
+    const finish = () => { setLoading(false); es.close() }
+
+    es.onmessage = (e: MessageEvent) => {
+      const data = JSON.parse(e.data)
+      if (data.type === 'progress') {
+        setFullProgress({ page: 0, loaded: data.transactions ?? 0, message: data.message, done: false })
+      }
+      if (data.type === 'done') {
+        setFullProgress(null)
+        if (!data.nodes?.length) {
+          setError(data.message || 'Данные не найдены')
+          setNodes([]); setLinks([])
+        } else {
+          setNodes(data.nodes)
+          setCenter(address.toLowerCase())
+          setLinks(data.links)
+          const cap: Capitalization | undefined = data.capitalization
+          const capText = cap ? `, ${capitalizationText(cap, data.reachedHop ?? 1)}` : ''
+          const hopText = data.reachedHop ? `, хопов: ${data.reachedHop} из ${data.hops}` : ''
+          setInfo(`Загружено: ${data.nodes.length} кошельков, ${data.links.length} транзакций${hopText}${capText}`)
+        }
+        finish()
+      }
+      if (data.type === 'error') {
+        setError(data.message)
+        setFullProgress(null)
+        finish()
+      }
+    }
+    es.onerror = () => {
+      setError('Ошибка соединения с API')
+      setFullProgress(null)
+      finish()
+    }
+  }
+
   const handleBuild = () => {
-    if (mode === 'token' && fullMode) fetchFullGraph()
+    if (mode === 'wallet') fetchWalletGraph()
+    else if (fullMode) fetchFullGraph()
     else fetchGraph()
   }
 
@@ -225,6 +277,31 @@ export default function Home() {
           </label>
         )}
 
+        {/* Хопы — только для кошелька */}
+        {mode === 'wallet' && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, color: '#94a3b8', fontSize: 14 }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              Хопов
+              <input
+                type="number" min={HOPS_MIN} max={HOPS_MAX} value={hops}
+                onChange={e => setHops(clamp(Number(e.target.value), HOPS_MIN, HOPS_MAX))}
+                style={numberInputStyle}
+              />
+            </label>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              Адресов на хоп
+              <input
+                type="number" min={WIDTH_MIN} max={WIDTH_MAX} value={hopWidth}
+                onChange={e => setHopWidth(clamp(Number(e.target.value), WIDTH_MIN, WIDTH_MAX))}
+                style={numberInputStyle}
+              />
+            </label>
+            <span style={{ fontSize: 12, color: '#64748b' }} title="Etherscan на бесплатном ключе — 3 запроса в секунду">
+              ≈ до {estimateMinutes(hops, hopWidth).toLocaleString('ru-RU')} мин
+            </span>
+          </div>
+        )}
+
         <button
           onClick={handleBuild}
           disabled={loading}
@@ -237,9 +314,12 @@ export default function Home() {
           }}
         >
           {loading
-            ? (fullMode && mode === 'token' ? '⏳ Загружаем...' : '⏳ Загрузка...')
+            ? (fullMode && mode === 'token' ? 'Загружаем…' : 'Загрузка…')
             : (fullMode && mode === 'token' ? '🔍 Полный скан' : 'Построить граф')}
         </button>
+
+        {/* Прелоадер — крутится, пока строится граф */}
+        {loading && <span className="spinner" role="status" aria-label="Граф строится" />}
       </div>
 
       {/* Подсказка */}
@@ -259,6 +339,11 @@ export default function Home() {
       {info && (
         <p style={{ color: 'rgb(22, 163, 74)', fontSize: 20, fontWeight: 600, marginBottom: 16 }}>
           ✅ {info}{ticker ? ` · Токен: ${ticker}` : ''}
+          {ticker && tokenPrice !== undefined && (
+            <span style={{ fontSize: 15, fontWeight: 400, color: tokenPrice === null ? '#f59e0b' : 'rgb(22, 163, 74)' }}>
+              {tokenPrice === null ? ' (цена неизвестна — пороги эвристик в штуках токена)' : ` (${formatPrice(tokenPrice)})`}
+            </span>
+          )}
         </p>
       )}
 
@@ -291,7 +376,16 @@ export default function Home() {
         </div>
       )}
 
-      <style>{`@keyframes progressPulse { 0%,100%{opacity:1} 50%{opacity:.4} }`}</style>
+      <style>{`
+        @keyframes progressPulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+        @keyframes spin { to { transform: rotate(360deg) } }
+        .spinner {
+          width: 26px; height: 26px; border-radius: 50%;
+          border: 3px solid #334155; border-top-color: #3b82f6;
+          animation: spin .8s linear infinite;
+          display: inline-block; flex-shrink: 0;
+        }
+      `}</style>
 
       {/* ── LSTM прогноз ── */}
       <div style={{ marginBottom: 20 }}>

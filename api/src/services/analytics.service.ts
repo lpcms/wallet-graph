@@ -103,6 +103,7 @@ export class AnalyticsService {
   computeMarkov(
     addresses: string[],
     transactions: EtherscanTransaction[],
+    inactiveBelow = 0.001,   // оборот окна (в штуках актива), ниже которого окно неактивно — INACTIVE_USD по цене
   ): MarkovPhase {
 
     const addrSet = new Set(addresses.map(a => a.toLowerCase()))
@@ -145,7 +146,7 @@ export class AnalyticsService {
       })
 
       const total = inFlow + outFlow
-      if (total < 0.001) return 'INACTIVE'
+      if (total < inactiveBelow) return 'INACTIVE'
 
       const ratio = inFlow / total
       if (ratio > 0.7)  return 'ACCUMULATE'

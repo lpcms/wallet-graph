@@ -1,11 +1,12 @@
 import { describe, expect, it, vi } from 'vitest'
 import { GraphController } from '../src/controllers/graph.controller'
-import { SERVICE_ADDRESSES } from '../src/constants/known-addresses'
 import type { EtherscanService } from '../src/services/etherscan.service'
 import type { GraphBuilderService } from '../src/services/graph-builder.service'
 import type { ClusterService } from '../src/services/cluster.service'
 import type { AnalyticsService } from '../src/services/analytics.service'
 import type { ModelService } from '../src/services/model.service'
+import type { PriceService } from '../src/services/price.service'
+import type { HopExpansionService } from '../src/services/hop-expansion.service'
 import type { ClusterInfo } from '../src/types'
 import { addr, tx } from './helpers'
 
@@ -16,41 +17,12 @@ function controllerWith(etherscan: Partial<Record<keyof EtherscanService, unknow
     {} as ClusterService,
     {} as AnalyticsService,
     {} as ModelService,
+    {} as PriceService,
+    {} as HopExpansionService,
   )
 }
 
 const root = addr(0x100)
-const cex  = [...SERVICE_ADDRESSES.keys()][0]
-
-describe('GraphController: выбор контрагентов для 2-го хопа', () => {
-  it('сортирует по объёму ETH и пропускает биржи и контракты', async () => {
-    const [x1, x2, x3, contract] = [addr(1), addr(2), addr(3), addr(4)]
-    const getContracts = vi.fn(async (list: string[]) => new Set(list.filter(a => a === contract)))
-    const controller = controllerWith({ getContracts })
-
-    const picked = await controller['selectHop2Counterparties'](root, [
-      tx(root, x1, 100),
-      tx(x2, root, 50),
-      tx(root, cex, 1000),
-      tx(root, contract, 500),
-      tx(root, x3, 10),
-    ])
-
-    expect(picked).toEqual([x1, x2, x3])
-    // x2 сам отправлял tx — значит кошелёк, проверять его на контракт не нужно
-    expect(getContracts.mock.calls[0][0]).toEqual([contract, x1, x3])
-  })
-
-  it('берёт не больше 50 контрагентов', async () => {
-    const controller = controllerWith({ getContracts: async () => new Set<string>() })
-    const rootTx = Array.from({ length: 70 }, (_, i) => tx(root, addr(i + 1), i + 1))
-
-    const picked = await controller['selectHop2Counterparties'](root, rootTx)
-
-    expect(picked).toHaveLength(50)
-    expect(picked[0]).toBe(addr(70))
-  })
-})
 
 describe('GraphController: капитализация группы', () => {
   const [friend, contract, service, small] = [addr(1), addr(2), addr(3), addr(4)]
@@ -89,12 +61,30 @@ describe('GraphController: капитализация группы', () => {
       new Map([[root, cluster], [friend, cluster]]), 2000, hints,
     )
 
-    expect(cap.fullEth).toBe(15.5)        // root 10 + friend 5 + small 0.5
-    expect(cap.fullAddresses).toBe(3)
+    expect(cap.allEth).toBe(15.5)         // root 10 + friend 5 + small 0.5
+    expect(cap.allAddresses).toBe(3)
     expect(cap.clusterEth).toBe(15)       // root + friend
     expect(cap.clusterUsd).toBe(30_000)
     expect(cap.excludedContracts).toBe(1)
     expect(cap.excludedServices).toBe(1)
+  })
+
+  it('ближнее окружение — до 2 хопов, крупный кошелёк на дальнем хопе только во «всём окружении»', async () => {
+    const whale = addr(0x99)
+    const controller = controllerWith({ getBalances: async () => new Map(), getContracts: async () => new Set<string>() })
+    const hints = { verified: new Set([root, friend, small, whale]) }
+    const distances = new Map([[root, 0], [friend, 1], [small, 2], [whale, 5]])
+
+    const cap = await controller['computeCapitalization'](
+      root, [root, friend, small, whale], new Map([[root, 10], [friend, 5], [small, 0.5], [whale, 20_000]]),
+      new Map([[root, cluster], [friend, cluster]]), 2000, hints, distances,
+    )
+
+    expect(cap.nearHops).toBe(2)
+    expect(cap.nearEth).toBe(15.5)        // root + friend (1 хоп) + small (2 хопа)
+    expect(cap.nearAddresses).toBe(3)
+    expect(cap.allEth).toBe(20_015.5)     // + кит на 5-м хопе
+    expect(cap.allUsd).toBe(40_031_000)
   })
 
   it('догружает участников кластера вне графа и проверяет их на контракт', async () => {

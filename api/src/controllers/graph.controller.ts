@@ -1,4 +1,4 @@
-import { Controller, Get, Param, Res } from '@nestjs/common'
+import { Controller, Get, Param, Query, Res } from '@nestjs/common'
 import type { Response } from 'express'
 import { CONFIG } from '../config'
 import { KNOWN_ADDRESSES, SERVICE_ADDRESSES } from '../constants/known-addresses'
@@ -8,8 +8,12 @@ import { AnalyticsService } from '../services/analytics.service'
 import { EtherscanService } from '../services/etherscan.service'
 import { GraphBuilderService } from '../services/graph-builder.service'
 import { ModelService } from '../services/model.service'
-import { txAmount } from '../lib/amount'
+import { PriceService } from '../services/price.service'
+import { HopExpansionService, clampHops, clampWidth } from '../services/hop-expansion.service'
 import { ZERO_ADDRESS, type EntityHints } from '../lib/entities'
+import { thresholdsFor } from '../lib/thresholds'
+import { hopDistances } from '../lib/hops'
+import { isTokenTransfer } from '../lib/amount'
 
 // ===== КОНТРОЛЛЕР =====
 
@@ -21,6 +25,8 @@ export class GraphController {
     private clusterService: ClusterService,
     private analyticsService: AnalyticsService,
     private modelService: ModelService,
+    private priceService: PriceService,
+    private hopExpansionService: HopExpansionService,
   ) {}
 
   @Get('/health')
@@ -51,8 +57,10 @@ export class GraphController {
     ethPriceUsd: number,
     meta: Record<string, unknown>,
     // rootAddress — режим кошелька: балансы всех адресов + капитализация;
-    // tokenAddress — режим токена: эмитент и создатель токена для категорий узлов
-    opts: { rootAddress?: string; tokenAddress?: string } = {},
+    // tokenAddress — режим токена: эмитент и создатель токена для категорий узлов;
+    // keepAddresses — раскрытые хопы: не выпадают из графа при обрезке до MAX_NODES
+    // txSteps — на каком шаге раскрытия хопов загружена каждая транзакция (hash → шаг)
+    opts: { rootAddress?: string; tokenAddress?: string; keepAddresses?: Set<string>; txSteps?: Map<string, number> } = {},
   ) {
     const root = opts.rootAddress?.toLowerCase()
     let transactions = txInput
@@ -85,13 +93,18 @@ export class GraphController {
       // Сортируем по времени desc, берём свежие
       const byTimeDesc = (a: EtherscanTransaction, b: EtherscanTransaction) => Number(b.timeStamp) - Number(a.timeStamp)
       if (root) {
-        // Режим кошелька: 2-й хоп получает до трети лимита, остальное — свежие tx самого кошелька.
-        // Иначе длинная история кошелька целиком вытеснила бы 2-й хоп (или наоборот)
+        // Режим кошелька: хопы получают до трети лимита, остальное — свежие tx самого кошелька.
+        // Иначе длинная история кошелька целиком вытеснила бы хопы (или наоборот).
+        // Среди tx хопов первыми идут переводы между раскрытыми адресами — сама цепочка хопов
+        const keep = opts.keepAddresses ?? new Set<string>()
         const isRootTx = (tx: EtherscanTransaction) =>
           tx.from?.toLowerCase() === root || tx.to?.toLowerCase() === root
-        const hop2 = filtered.filter(tx => !isRootTx(tx)).sort(byTimeDesc).slice(0, Math.floor(MAX_TX_FOR_ANALYSIS / 3))
-        const own  = filtered.filter(isRootTx).sort(byTimeDesc).slice(0, MAX_TX_FOR_ANALYSIS - hop2.length)
-        filtered = [...own, ...hop2]
+        const isChain = (tx: EtherscanTransaction) => keep.has(tx.from?.toLowerCase()) && keep.has(tx.to?.toLowerCase())
+        const hops = filtered.filter(tx => !isRootTx(tx))
+          .sort((a, b) => Number(isChain(b)) - Number(isChain(a)) || byTimeDesc(a, b))
+          .slice(0, Math.floor(MAX_TX_FOR_ANALYSIS / 3))
+        const own  = filtered.filter(isRootTx).sort(byTimeDesc).slice(0, MAX_TX_FOR_ANALYSIS - hops.length)
+        filtered = [...own, ...hops]
       } else {
         filtered = filtered.sort(byTimeDesc).slice(0, MAX_TX_FOR_ANALYSIS)
       }
@@ -116,9 +129,11 @@ export class GraphController {
     const MAX_NODES = 2000
     let txForGraph = transactions
     if (transactions.length > 10000) {
-      const topSet = new Set(
-        [...addrCount.entries()].sort((a, b) => b[1] - a[1]).slice(0, MAX_NODES).map(([a]) => a)
-      )
+      // + раскрытые хопы: малоактивные адреса дальних хопов иначе выпали бы из графа
+      const topSet = new Set([
+        ...[...addrCount.entries()].sort((a, b) => b[1] - a[1]).slice(0, MAX_NODES).map(([a]) => a),
+        ...(opts.keepAddresses ?? []),
+      ])
       // Оба конца в топе: с «||» хаб (сам кошелёк) протаскивал в граф всех своих контрагентов
       txForGraph = transactions.filter(tx =>
         topSet.has(tx.from?.toLowerCase()) && topSet.has(tx.to?.toLowerCase())
@@ -160,19 +175,48 @@ export class GraphController {
       : await this.collectTokenHints(opts.tokenAddress, addrCount)
     const excluded = new Set([...(entityHints.contracts ?? []), ...(entityHints.services ?? [])])
 
+    // Цена актива: пороги эвристик (пыль, «общий источник») заданы в долларах и переводятся
+    // в штуки актива по ней. Граф кошелька — ETH по курсу ETH, граф токена — цена с Binance.
+    const assetSymbol   = opts.tokenAddress ? transactions.find(isTokenTransfer)?.tokenSymbol : 'ETH'
+    const assetPriceUsd = opts.tokenAddress ? await this.priceService.getTokenPriceUsd(assetSymbol) : ethPriceUsd
+    const thresholds    = thresholdsFor(assetPriceUsd)
+
     console.log('  Запускаем K-means + Union-Find кластеризацию...')
     // Для больших наборов (>20000 tx) пропускаем GR/Markov для одиночных адресов
     const skipAnalytics = transactions.length > 10000
     if (skipAnalytics) console.log('  [Opt] Большой набор — GR/Markov только для кластеров')
     const clusterMap = this.clusterService.buildClusters(
-      transactions, realBalances, ethPriceUsd, this.analyticsService, skipAnalytics, excluded,
+      transactions, realBalances, ethPriceUsd, this.analyticsService, skipAnalytics, excluded, thresholds,
     )
 
+    // Число переводов от кошелька до каждого адреса — по тем же связям, что войдут в граф
+    const distances = root
+      ? hopDistances(txForGraph.filter(tx => tx.from && tx.to).map(tx => ({ sourceAddress: tx.from, targetAddress: tx.to })), root)
+      : new Map<string, number>()
+
     const capitalization = root
-      ? await this.computeCapitalization(root, balanceAddresses, realBalances, clusterMap, ethPriceUsd, entityHints)
+      ? await this.computeCapitalization(root, balanceAddresses, realBalances, clusterMap, ethPriceUsd, entityHints, distances)
       : undefined
 
-    const graph = this.graphBuilderService.buildGraph(txForGraph, realBalances, ethPriceUsd, clusterMap, entityHints)
+    const graph = this.graphBuilderService.buildGraph(txForGraph, realBalances, ethPriceUsd, clusterMap, entityHints, assetPriceUsd)
+
+    // Номер хопа — расстояние от исследуемого кошелька по связям графа.
+    // Шаг цепочки — самый ранний шаг раскрытия среди связей адреса в графе (не меньше расстояния)
+    if (root) {
+      const chainHops = new Map<string, number>([[root, 0]])
+      for (const link of graph.links) {
+        const step = opts.txSteps?.get(link.txId)
+        if (step === undefined) continue
+        for (const a of [link.sourceAddress.toLowerCase(), link.targetAddress.toLowerCase()]) {
+          if (!chainHops.has(a) || chainHops.get(a)! > step) chainHops.set(a, step)
+        }
+      }
+      chainHops.set(root, 0)
+      graph.nodes.forEach(n => {
+        n.hop      = distances.get(n.walletAddress.toLowerCase())
+        n.chainHop = chainHops.get(n.walletAddress.toLowerCase())
+      })
+    }
 
     // Топ кластеров для сводки
     const seen = new Set<string>()
@@ -201,6 +245,8 @@ export class GraphController {
     return {
       ...meta,
       ethPriceUsd,
+      assetSymbol,
+      assetPriceUsd,           // null — цена токена неизвестна, пороги эвристик в штуках токена
       totalTransactions: transactions.length,
       nodesCount:        graph.nodes.length,
       linksCount:        graph.links.length,
@@ -249,9 +295,11 @@ export class GraphController {
   }
 
   // ── Капитализация группы кошелька (ETH-балансы × курс) ────────────
-  // full    — все адреса графа (кошелёк + 1-й и 2-й хоп)
+  // near    — ближнее окружение: адреса не дальше NEAR_HOPS переводов от кошелька
+  // all     — всё окружение: все адреса графа (на дальних хопах попадаются крупные
+  //           холодные кошельки, поэтому эта сумма может быть в десятки раз больше)
   // cluster — кластер самого кошелька (адреса, которые Union-Find считает одним владельцем)
-  // В обоих вариантах исключены биржи (SERVICE_ADDRESSES), смарт-контракты и сервисные кошельки:
+  // Везде исключены биржи (SERVICE_ADDRESSES), смарт-контракты и сервисные кошельки:
   // на WETH, мостах, стейкинге и биржах лежат миллиарды чужих средств — они не принадлежат группе.
   private async computeCapitalization(
     root: string,
@@ -260,7 +308,9 @@ export class GraphController {
     clusterMap: Map<string, ClusterInfo>,
     ethPriceUsd: number,
     hints: EntityHints,
+    distances: Map<string, number> = new Map(),   // число переводов от кошелька
   ) {
+    const NEAR_HOPS = 2
     const contracts = hints.contracts ?? new Set<string>()
     const services  = hints.services  ?? new Set<string>()
 
@@ -281,18 +331,25 @@ export class GraphController {
 
     const isGroupMember = (a: string) => !contracts.has(a) && !services.has(a)
     const sumEth = (addrs: string[]) => addrs.reduce((s, a) => s + (realBalances.get(a) ?? 0), 0)
-    const fullAddrs    = graphAddresses.filter(isGroupMember)
+    const allAddrs     = graphAddresses.filter(isGroupMember)
+    const nearAddrs    = allAddrs.filter(a => a === root || (distances.get(a) ?? Infinity) <= NEAR_HOPS)
     const clusterAddrs = clusterAddresses.filter(isGroupMember)
-    const fullEth      = sumEth(fullAddrs)
+    const allEth       = sumEth(allAddrs)
+    const nearEth      = sumEth(nearAddrs)
     const clusterEth   = sumEth(clusterAddrs)
 
-    console.log(`  [Cap] полная: ${fullAddrs.length} адресов = ${fullEth.toFixed(2)} ETH = $${(fullEth * ethPriceUsd).toFixed(0)}`)
+    console.log(`  [Cap] ближнее (до ${NEAR_HOPS} хопов): ${nearAddrs.length} адресов = ${nearEth.toFixed(2)} ETH = $${(nearEth * ethPriceUsd).toFixed(0)}`)
+    console.log(`  [Cap] всё окружение: ${allAddrs.length} адресов = ${allEth.toFixed(2)} ETH = $${(allEth * ethPriceUsd).toFixed(0)}`)
     console.log(`  [Cap] кластер: ${clusterAddrs.length} адресов = ${clusterEth.toFixed(2)} ETH = $${(clusterEth * ethPriceUsd).toFixed(0)}`)
 
     return {
-      fullUsd:           Math.round(fullEth * ethPriceUsd),
-      fullEth,
-      fullAddresses:     fullAddrs.length,
+      nearHops:          NEAR_HOPS,
+      nearUsd:           Math.round(nearEth * ethPriceUsd),
+      nearEth,
+      nearAddresses:     nearAddrs.length,
+      allUsd:            Math.round(allEth * ethPriceUsd),
+      allEth,
+      allAddresses:      allAddrs.length,
       clusterUsd:        Math.round(clusterEth * ethPriceUsd),
       clusterEth,
       clusterAddresses:  clusterAddrs.length,
@@ -332,64 +389,72 @@ export class GraphController {
     return { contracts, services, issuers, verified }
   }
 
-  // ── 2-й хоп: топ-50 контрагентов кошелька по объёму ETH ──────────
-  // Биржи и смарт-контракты не раскрываем: история DEX-роутера или WETH —
-  // это тысячи чужих пользователей, к группе кошелька они отношения не имеют.
-  private async selectHop2Counterparties(root: string, rootTx: EtherscanTransaction[]): Promise<string[]> {
-    const HOP2_LIMIT = 50
-    const volume   = new Map<string, number>()
-    const knownEoa = new Set<string>()
-    for (const tx of rootTx) {
-      const from = tx.from?.toLowerCase()
-      const to   = tx.to?.toLowerCase()
-      if (from) knownEoa.add(from)
-      const other = from === root ? to : from
-      if (!other || other === root || SERVICE_ADDRESSES.has(other)) continue
-      volume.set(other, (volume.get(other) || 0) + txAmount(tx))
-    }
+  // ── Граф кошелька ─────────────────────────────────────────────────
+  // hops — сколько хопов раскрывать (1–15), width — сколько адресов на каждом хопе (5–50).
+  // По умолчанию 2 × 50 — как было до настройки хопов.
+  private async buildWalletGraph(
+    address: string,
+    hopsParam: number,
+    widthParam: number,
+    onProgress: (p: { message: string; hop?: number; hops?: number; transactions?: number }) => void = () => {},
+  ) {
+    const root  = address.toLowerCase()
+    const hops  = clampHops(hopsParam)
+    const width = clampWidth(widthParam)
+    console.log(`\n--- Граф кошелька: ${address} (хопов ${hops}, адресов на хоп ${width})`)
 
-    const ranked = [...volume.entries()]
-      .filter(([, eth]) => eth > 0)
-      .sort((a, b) => b[1] - a[1])
-      .map(([addr]) => addr)
-
-    // Идём по рейтингу пачками и отсеиваем контракты, пока не наберём 50 кошельков
-    const picked: string[] = []
-    for (let i = 0; i < ranked.length && picked.length < HOP2_LIMIT; i += HOP2_LIMIT) {
-      const batch     = ranked.slice(i, i + HOP2_LIMIT)
-      const contracts = await this.etherscanService.getContracts(batch.filter(a => !knownEoa.has(a)))
-      for (const addr of batch) {
-        if (!contracts.has(addr) && picked.length < HOP2_LIMIT) picked.push(addr)
-      }
-    }
-    return picked
-  }
-
-  @Get('/graph/wallet/:address')
-  async getWalletGraph(@Param('address') address: string) {
-    console.log('\n--- Граф кошелька:', address)
-    const root = address.toLowerCase()
+    onProgress({ message: 'Загружаем историю кошелька…', hop: 1, hops })
     const [rootTx, ethPriceUsd] = await Promise.all([
       this.etherscanService.getWalletTransactions(address),
       this.etherscanService.getEthPriceUsd(),
     ])
+    onProgress({ message: `История кошелька: ${rootTx.length.toLocaleString('ru-RU')} транзакций`, hop: 1, hops, transactions: rootTx.length })
 
-    // 2-й хоп: последние PAGE_SIZE tx каждого из топ-50 контрагентов
-    const hop2 = await this.selectHop2Counterparties(root, rootTx)
-    const hop2Tx = (await Promise.all(hop2.map(addr =>
-      this.etherscanService.getRecentWalletTransactions(addr).catch(err => {
-        console.log(`  [Hop2] ${addr.slice(0, 10)}... ошибка: ${err}`)
-        return [] as EtherscanTransaction[]
-      }),
-    ))).flat()
-    console.log(`  [Hop2] ${hop2.length} контрагентов → +${hop2Tx.length} tx`)
+    const result = await this.hopExpansionService.expand(root, rootTx, hops, width, onProgress)
+    onProgress({ message: 'Анализируем граф: балансы, контракты, кластеры…', hops, transactions: result.transactions.length })
 
-    return this.buildAndReturn([...rootTx, ...hop2Tx], ethPriceUsd, {
+    return this.buildAndReturn(result.transactions, ethPriceUsd, {
       address,
-      hops:            2,
-      hop1Tx:          rootTx.length,
-      hop2Wallets:     hop2.length,
-    }, { rootAddress: root })
+      hops,
+      hopWidth:     width,
+      reachedHop:   1 + result.expandedByHop.length,   // до какого хопа дошли цепочки
+      hopWallets:   result.expandedByHop.map(a => a.length),
+      hop1Tx:       rootTx.length,
+    }, { rootAddress: root, keepAddresses: result.expanded, txSteps: result.txSteps })
+  }
+
+  @Get('/graph/wallet/:address')
+  async getWalletGraph(
+    @Param('address') address: string,
+    @Query('hops') hops = '2',
+    @Query('width') width = '50',
+  ) {
+    return this.buildWalletGraph(address, Number(hops), Number(width))
+  }
+
+  // То же с прогрессом через SSE: {type:'progress', message, hop, hops, transactions} → {type:'done', ...граф}
+  @Get('/graph/wallet/:address/stream')
+  async getWalletGraphStream(
+    @Param('address') address: string,
+    @Query('hops') hops = '2',
+    @Query('width') width = '50',
+    @Res() res: Response,
+  ) {
+    res.setHeader('Content-Type',  'text/event-stream')
+    res.setHeader('Cache-Control', 'no-cache')
+    res.setHeader('Connection',    'keep-alive')
+    res.setHeader('Access-Control-Allow-Origin', '*')
+    res.flushHeaders()
+    const send = (data: object) => res.write(`data: ${JSON.stringify(data)}\n\n`)
+
+    try {
+      const graph = await this.buildWalletGraph(address, Number(hops), Number(width), p => send({ type: 'progress', ...p }))
+      send({ type: 'done', ...graph })
+    } catch (err) {
+      console.error('  [Wallet] Ошибка:', err)
+      send({ type: 'error', message: String(err) })
+    }
+    res.end()
   }
 
   @Get('/graph/token/:address')

@@ -8,6 +8,8 @@ import type { GraphBuilderService as GB } from '../src/services/graph-builder.se
 import type { ClusterService } from '../src/services/cluster.service'
 import type { AnalyticsService } from '../src/services/analytics.service'
 import type { ModelService } from '../src/services/model.service'
+import type { PriceService } from '../src/services/price.service'
+import type { HopExpansionService } from '../src/services/hop-expansion.service'
 import { addr, tokenTx } from './helpers'
 
 const BINANCE  = '0x28c6c06298d514db089934071355e5743bf21d60'
@@ -80,7 +82,7 @@ describe('GraphController: категории в графе токена', () =>
     const getHighActivity = vi.fn(async (list: string[]) => new Set(list.filter(a => a === hot)))
     const controller = new GraphController(
       { getContractCreators, getHighActivity } as unknown as EtherscanService,
-      {} as GB, {} as ClusterService, {} as AnalyticsService, {} as ModelService,
+      {} as GB, {} as ClusterService, {} as AnalyticsService, {} as ModelService, {} as PriceService, {} as HopExpansionService,
     )
     // активность: pool > hot > известный Binance > нулевой адрес > обычные
     const addrCount = new Map([[pool, 50], [hot, 40], [BINANCE, 30], [ZERO_ADDRESS, 20], [addr(1), 1]])

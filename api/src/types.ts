@@ -34,6 +34,8 @@ export interface GraphNode {
   clusterArchetype?: string
   kmeansSignals?: string[]
   behavior?: BehaviorProfile
+  hop?: number                // граф кошелька: число переводов от исследуемого кошелька (0 — он сам)
+  chainHop?: number           // шаг цепочки раскрытия, на котором адрес впервые встретился (≥ hop)
   gr?: GrowthReadiness
   markov?: MarkovPhase
 }
